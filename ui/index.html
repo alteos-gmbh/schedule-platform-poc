@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Schedule Platform PoC</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #f6f7f9;
+        --panel: #ffffff;
+        --line: #d9dde3;
+        --ink: #14171c;
+        --muted: #5d6672;
+        --accent: #2b5fd9;
+        --ok: #17794a;
+        --warn: #9a5b00;
+        --bad: #b3261e;
+        --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #14171c;
+          --panel: #1c2128;
+          --line: #2d343d;
+          --ink: #e6e9ee;
+          --muted: #98a2b0;
+          --accent: #7aa2ff;
+          --ok: #4ec98a;
+          --warn: #e0a458;
+          --bad: #f2857c;
+        }
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--ink);
+        font: 15px/1.5 system-ui, -apple-system, sans-serif;
+      }
+      header {
+        background: var(--panel);
+        border-bottom: 1px solid var(--line);
+        padding: 14px 20px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px 28px;
+        align-items: center;
+        position: sticky;
+        top: 0;
+        z-index: 5;
+      }
+      header h1 { font-size: 17px; margin: 0; }
+      .ident { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+      main {
+        padding: 20px;
+        display: grid;
+        gap: 20px;
+        grid-template-columns: 1fr;
+        max-width: 1500px;
+      }
+      @media (min-width: 1100px) {
+        main { grid-template-columns: 1fr 1fr; }
+        .wide { grid-column: 1 / -1; }
+      }
+      section {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 16px 18px;
+        min-width: 0;
+      }
+      h2 {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: var(--muted);
+        margin: 0 0 12px;
+      }
+      button {
+        font: inherit;
+        padding: 6px 12px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--panel);
+        color: var(--ink);
+        cursor: pointer;
+      }
+      button:hover { border-color: var(--accent); }
+      button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+      button.tiny { padding: 2px 7px; font-size: 12px; }
+      label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+      input, select {
+        font: inherit;
+        width: 100%;
+        padding: 6px 8px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--bg);
+        color: var(--ink);
+      }
+      .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); }
+      .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      .switches { display: flex; gap: 18px; flex-wrap: wrap; align-items: center; }
+      .switches label { display: flex; gap: 6px; align-items: center; font-size: 13px; color: var(--ink); margin: 0; }
+      .switches input { width: auto; }
+      table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      th {
+        text-align: left;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+        color: var(--muted);
+        border-bottom: 1px solid var(--line);
+        padding: 6px 8px 6px 0;
+        white-space: nowrap;
+      }
+      td { padding: 7px 8px 7px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
+      td.mono, .mono { font-family: var(--mono); font-size: 12px; }
+      .scroll { overflow-x: auto; }
+      .badge {
+        display: inline-block;
+        padding: 1px 7px;
+        border-radius: 20px;
+        font-size: 11px;
+        font-weight: 600;
+        border: 1px solid currentColor;
+        white-space: nowrap;
+      }
+      .s-pending { color: var(--accent); }
+      .s-processing { color: var(--warn); }
+      .s-executed { color: var(--ok); }
+      .s-cancelled { color: var(--muted); }
+      .s-waitingExecutionApproval { color: var(--warn); }
+      .flag { color: var(--bad); font-size: 11px; font-weight: 600; }
+      .feed { margin: 0; padding: 0; list-style: none; max-height: 320px; overflow-y: auto; }
+      .feed li { border-bottom: 1px solid var(--line); padding: 7px 0; font-family: var(--mono); font-size: 12px; }
+      .feed time { color: var(--muted); }
+      .empty { color: var(--muted); font-style: italic; font-size: 13px; }
+      pre { margin: 4px 0 0; white-space: pre-wrap; word-break: break-word; font-size: 11px; color: var(--muted); }
+      .note { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Schedule Platform PoC</h1>
+      <span class="ident" id="ident">connecting…</span>
+      <div class="switches" id="switches">
+        <label><input type="checkbox" id="breakTarget" /> break publish</label>
+        <label><input type="checkbox" id="breakNext" /> break chain write</label>
+        <label><input type="checkbox" id="legacyChain" /> legacy ordering</label>
+      </div>
+      <div class="row">
+        <button id="reconcile">reconcile now</button>
+        <button id="reset">reset everything</button>
+      </div>
+    </header>
+
+    <main>
+      <section class="wide">
+        <h2>Create a schedule</h2>
+        <div class="grid">
+          <div>
+            <label for="version">shape</label>
+            <select id="version">
+              <option value="v1">v1 — messageTopicName + context</option>
+              <option value="v2">v2 — opaque message</option>
+            </select>
+          </div>
+          <div>
+            <label for="inSeconds">fires in (seconds)</label>
+            <input id="inSeconds" type="number" value="70" min="60" />
+          </div>
+          <div>
+            <label for="period">period (ISO 8601 duration, blank = one-shot)</label>
+            <input id="period" value="PT2M" />
+          </div>
+          <div>
+            <label for="endAt">endAt (blank = never ends)</label>
+            <input id="endAt" placeholder="2026-09-09T00:00:00.000Z" />
+          </div>
+          <div>
+            <label for="topic">messageTopicName</label>
+            <input id="topic" value="policy-obligations" />
+          </div>
+          <div>
+            <label for="command">context.command</label>
+            <input id="command" value="processObligation" />
+          </div>
+          <div>
+            <label for="policyId">context.policyId</label>
+            <input id="policyId" class="mono" />
+          </div>
+          <div>
+            <label for="partnerId">context.partnerId</label>
+            <input id="partnerId" class="mono" />
+          </div>
+        </div>
+        <p class="row" style="margin-top: 14px">
+          <button class="primary" id="create">create</button>
+          <label style="display: flex; gap: 6px; align-items: center; margin: 0; color: var(--ink)">
+            <input type="checkbox" id="waitForApproval" style="width: auto" />
+            __waitForApproval
+          </label>
+          <button id="newPolicy">new policy id</button>
+          <span class="note" id="createResult"></span>
+        </p>
+        <p class="note">
+          Synthetic ids only. Never paste a real policy or partner id into this console — a schedule
+          context reaches the queue and the logs.
+        </p>
+      </section>
+
+      <section class="wide">
+        <h2>Rows in DynamoDB — the source of truth</h2>
+        <div class="scroll">
+          <table>
+            <thead>
+              <tr>
+                <th>id</th>
+                <th>status</th>
+                <th>triggerAt</th>
+                <th>period</th>
+                <th>counter</th>
+                <th>timer</th>
+                <th>attempts</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="rows">
+              <tr><td colspan="8" class="empty">nothing yet</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section>
+        <h2>Timers in EventBridge Scheduler</h2>
+        <ul class="feed" id="timers">
+          <li class="empty">nothing yet</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>Dead letters — Lambda's failure destination</h2>
+        <ul class="feed" id="dlq">
+          <li class="empty">nothing yet</li>
+        </ul>
+      </section>
+
+      <section class="wide">
+        <h2>Fired — what actually reached the queue</h2>
+        <ul class="feed" id="fired">
+          <li class="empty">nothing yet</li>
+        </ul>
+      </section>
+    </main>
+
+    <script type="module">
+      const $ = (id) => document.getElementById(id);
+      const short = (id) => String(id).slice(0, 8);
+
+      const api = async (method, path, body) => {
+        const response = await fetch(`/api${path}`, {
+          method,
+          headers: body ? { 'content-type': 'application/json' } : undefined,
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        const text = await response.text();
+        try {
+          return { status: response.status, data: JSON.parse(text) };
+        } catch {
+          return { status: response.status, data: text };
+        }
+      };
+
+      // ---- identity -------------------------------------------------------------------------
+      const config = await (await fetch('/config')).json();
+      $('ident').textContent = `${config.functionName} · ${config.region} · account ${config.account}`;
+
+      // ---- create ---------------------------------------------------------------------------
+      const freshPolicy = () => {
+        $('policyId').value = crypto.randomUUID();
+      };
+      freshPolicy();
+      $('partnerId').value = crypto.randomUUID();
+      $('newPolicy').addEventListener('click', freshPolicy);
+
+      $('create').addEventListener('click', async () => {
+        const triggerAt = new Date(
+          Date.now() + Number($('inSeconds').value) * 1000
+        ).toISOString();
+
+        const context = {
+          command: $('command').value,
+          partnerId: $('partnerId').value,
+          policyId: $('policyId').value,
+        };
+        if ($('waitForApproval').checked) context.__waitForApproval = true;
+
+        const item = { triggerAt };
+        if ($('period').value.trim()) item.period = $('period').value.trim();
+        if ($('endAt').value.trim()) item.endAt = $('endAt').value.trim();
+
+        const v2 = $('version').value === 'v2';
+        if (v2) {
+          item.message = {
+            topicName: $('topic').value,
+            payload: { command: $('command').value, policyId: context.policyId },
+          };
+          item.context = context;
+        } else {
+          item.messageTopicName = $('topic').value;
+          item.context = context;
+        }
+
+        const { status, data } = await api(
+          'POST',
+          v2 ? '/v2/schedule' : '/v1/schedule',
+          [item]
+        );
+        $('createResult').textContent =
+          status === 201
+            ? `created ${data.created.map((c) => short(c.id)).join(', ')} as ${data.created[0].status}`
+            : `${status}: ${JSON.stringify(data.errors ?? data)}`;
+        refresh();
+      });
+
+      // ---- switches -------------------------------------------------------------------------
+      const switchIds = ['breakTarget', 'breakNext', 'legacyChain'];
+      let applyingSwitches = false;
+
+      for (const id of switchIds) {
+        $(id).addEventListener('change', async () => {
+          applyingSwitches = true;
+          await api('POST', '/_debug/config', {
+            breakTarget: $('breakTarget').checked,
+            breakNext: $('breakNext').checked,
+            legacyChain: $('legacyChain').checked,
+          });
+          applyingSwitches = false;
+          refresh();
+        });
+      }
+
+      $('reconcile').addEventListener('click', async () => {
+        const { data } = await api('POST', '/_debug/reconcile');
+        $('createResult').textContent = `reconciler: ${JSON.stringify(data)}`;
+        refresh();
+      });
+
+      $('reset').addEventListener('click', async () => {
+        await api('POST', '/_debug/reset');
+        $('createResult').textContent = 'reset';
+        refresh();
+      });
+
+      // ---- render ---------------------------------------------------------------------------
+      function renderRows(rows, timers) {
+        const body = $('rows');
+        if (rows.length === 0) {
+          body.innerHTML = '<tr><td colspan="8" class="empty">nothing yet</td></tr>';
+          return;
+        }
+
+        const live = new Set(timers);
+        body.replaceChildren(
+          ...rows.map((row) => {
+            const tr = document.createElement('tr');
+            const hasTimer = live.has(`poc-schedule-${row.id}`);
+            // A pending row with no timer is exactly the drift the reconciler exists to repair,
+            // so it is called out rather than left for someone to spot by eye.
+            const timerCell =
+              row.status === 'pending'
+                ? hasTimer
+                  ? 'yes'
+                  : '<span class="flag">MISSING</span>'
+                : hasTimer
+                  ? '<span class="flag">ORPHAN</span>'
+                  : '—';
+
+            tr.innerHTML = `
+              <td class="mono">${short(row.id)}</td>
+              <td><span class="badge s-${row.status}">${row.status}</span></td>
+              <td class="mono">${row.triggerAt ?? ''}</td>
+              <td class="mono">${row.period ?? '—'}</td>
+              <td class="mono">${row.processingData?.counter ?? '—'}</td>
+              <td class="mono">${timerCell}</td>
+              <td class="mono">${row.attempts ?? 0}${
+                row.lastError ? `<pre>${escapeHtml(row.lastError)}</pre>` : ''
+              }</td>
+              <td></td>`;
+
+            const actions = tr.lastElementChild;
+            actions.append(
+              button('cancel policy', () =>
+                api('DELETE', `/v2/schedule?policyId=${row.policyId}`)
+              ),
+              button('cancel command', () =>
+                api('POST', '/v1/schedule/cancel', {
+                  commands: [row.context?.command, row.context?.name].filter(Boolean),
+                  policyId: row.policyId,
+                })
+              ),
+              button('activate', () =>
+                api('POST', '/v1/schedule/activate', {
+                  scheduledActionIds: [row.id],
+                })
+              ),
+              button('drop timer', () =>
+                api('POST', '/_debug/orphan', { scheduleId: row.id })
+              ),
+              button('drop row', () =>
+                api('POST', '/_debug/orphan-row', { scheduleId: row.id })
+              )
+            );
+            return tr;
+          })
+        );
+      }
+
+      function button(text, action) {
+        const element = document.createElement('button');
+        element.className = 'tiny';
+        element.textContent = text;
+        element.addEventListener('click', async () => {
+          element.disabled = true;
+          await action();
+          element.disabled = false;
+          refresh();
+        });
+        return element;
+      }
+
+      function renderFeed(id, items, format) {
+        const list = $(id);
+        if (!items || items.length === 0) {
+          list.innerHTML = '<li class="empty">nothing yet</li>';
+          return;
+        }
+        list.replaceChildren(
+          ...items.map((item) => {
+            const li = document.createElement('li');
+            li.innerHTML = format(item);
+            return li;
+          })
+        );
+      }
+
+      const escapeHtml = (value) =>
+        String(value).replace(
+          /[&<>"']/g,
+          (character) =>
+            ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[
+              character
+            ]
+        );
+
+      async function refresh() {
+        const { data } = await api('GET', '/_debug/state');
+        if (!data || !data.rows) return;
+
+        if (!applyingSwitches) {
+          for (const id of switchIds) $(id).checked = Boolean(data.config[id]);
+        }
+
+        renderRows(data.rows, data.schedules);
+
+        renderFeed('timers', data.schedules, (name) => escapeHtml(name));
+
+        renderFeed('fired', data.fired, (item) => {
+          const topic = item.body?.topicName ?? '(no topic)';
+          const group = item.body?.payload?.authorizationData
+            ? ` scope=${escapeHtml(
+                item.body.payload.authorizationData.scopePartnerId ?? '—'
+              ).slice(0, 8)}`
+            : '';
+          return `<time>${escapeHtml(item.at)}</time> ${escapeHtml(topic)}${group}
+            <pre>${escapeHtml(JSON.stringify(item.body?.payload ?? item.body).slice(0, 400))}</pre>`;
+        });
+
+        renderFeed('dlq', data.dlq, (item) => {
+          const reason =
+            item.body?.responsePayload?.errorMessage ??
+            item.body?.requestPayload?.scheduleId ??
+            'see payload';
+          return `<time>${escapeHtml(item.at)}</time> <span class="flag">${escapeHtml(
+            reason
+          )}</span>
+            <pre>${escapeHtml(JSON.stringify(item.body).slice(0, 400))}</pre>`;
+        });
+      }
+
+      refresh();
+      setInterval(refresh, 2000);
+    </script>
+  </body>
+</html>

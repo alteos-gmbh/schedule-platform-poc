@@ -1,0 +1,8 @@
+node_modules/
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+
+# .terraform.lock.hcl is deliberately NOT ignored: it pins the provider versions, so a second
+# machine gets the same ones from `terraform init` rather than whatever is current that week.

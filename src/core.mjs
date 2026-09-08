@@ -1,0 +1,747 @@
+/**
+ * Shared core for the schedule-platform PoC: the store, the recurrence maths, the inbound
+ * validation and the outbound message envelope.
+ *
+ * Everything here is a deliberate port of `services/schedule`, not a redesign. Where the old
+ * service does something surprising, this file reproduces the surprise and says so in a comment —
+ * the point of the PoC is to prove the replacement behaves identically, and a quietly "improved"
+ * recurrence or endAt boundary would prove the opposite.
+ */
+
+import { randomUUID } from 'node:crypto';
+
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import {
+  DeleteCommand,
+  DynamoDBDocumentClient,
+  GetCommand,
+  PutCommand,
+  QueryCommand,
+  ScanCommand,
+  TransactWriteCommand,
+  UpdateCommand,
+} from '@aws-sdk/lib-dynamodb';
+import {
+  CreateScheduleCommand,
+  DeleteScheduleCommand,
+  GetScheduleCommand,
+  ListSchedulesCommand,
+  SchedulerClient,
+} from '@aws-sdk/client-scheduler';
+import {
+  DeleteMessageCommand,
+  ReceiveMessageCommand,
+  SendMessageCommand,
+  SQSClient,
+} from '@aws-sdk/client-sqs';
+import { DateTime, Duration } from 'luxon';
+
+// ---------------------------------------------------------------------------------------------
+// Constants copied from the service being replaced
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * All six values, not the four an outsider would guess. `preExecuted` and
+ * `waitingExecutionApproval` are set by other services writing the same table, so the replacement
+ * has to carry them even though nothing in the schedule service itself produces them.
+ * Source: services/schedule/src/common/ScheduledActionStatus.ts
+ */
+export const STATUS = Object.freeze({
+  Pending: 'pending',
+  Executed: 'executed',
+  Cancelled: 'cancelled',
+  PreExecuted: 'preExecuted',
+  Processing: 'processing',
+  WaitingExecutionApproval: 'waitingExecutionApproval',
+});
+
+/** Character-for-character the regex in both create validation schemas. */
+export const PERIOD_REGEX =
+  /^(-?)P(?=\d|T\d)(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)([DW]))?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$/;
+
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** services/schedule/src/common/config.ts */
+const APP_KEY = 'schedule-service';
+/** ACL_ALLOW_ALL_PERMISSION_STRING from @alteos-gmbh/common, resolved from the installed package. */
+const PERMISSIONS = [
+  '{"version":"1","action":"*","conditions":{},"internalResourceFields":[]}',
+];
+/** AuthorizationRole.AlteosService from @alteos-gmbh/acl.express. */
+const ROLE_ALTEOS_SERVICE = 'alteosService';
+
+/** Command values from @alteos-gmbh/dictionaries, needed by the processObligation special case. */
+export const COMMAND = Object.freeze({
+  ProcessObligation: 'processObligation',
+  ConcludePolicy: 'concludePolicy',
+});
+
+export const CONFIG_ID = '__config';
+
+// ---------------------------------------------------------------------------------------------
+// Environment
+// ---------------------------------------------------------------------------------------------
+
+export const env = Object.freeze({
+  table: required('POC_TABLE'),
+  group: required('POC_SCHEDULE_GROUP'),
+  queueUrl: required('POC_QUEUE_URL'),
+  fifoQueueUrl: required('POC_FIFO_QUEUE_URL'),
+  dlqUrl: required('POC_DLQ_URL'),
+  schedulerRoleArn: required('POC_SCHEDULER_ROLE_ARN'),
+  functionArn: required('POC_FUNCTION_ARN'),
+  processingTtlMinutes: Number(process.env.POC_PROCESSING_TTL_MINUTES ?? '5'),
+});
+
+function required(name) {
+  const value = process.env[name];
+  if (!value) throw new Error(`missing environment variable ${name}`);
+  return value;
+}
+
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+  marshallOptions: { removeUndefinedValues: true },
+});
+const scheduler = new SchedulerClient({});
+const sqs = new SQSClient({});
+
+// ---------------------------------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------------------------------
+
+export async function getRow(id) {
+  const { Item } = await ddb.send(
+    new GetCommand({ TableName: env.table, Key: { id } })
+  );
+  return Item;
+}
+
+export async function putRow(row) {
+  await ddb.send(new PutCommand({ TableName: env.table, Item: row }));
+  return row;
+}
+
+/**
+ * The status transition, guarded by a condition on the current value.
+ *
+ * This is what replaces the Redis lock (`locks:schedule:execute`, TTL 10s) the old service takes
+ * around its batch claim. A conditional write is the same guarantee from the store itself, so the
+ * PoC needs no cache at all — one fewer moving part in the replacement.
+ */
+export async function transition(id, from, to, extra = {}) {
+  const names = { '#status': 'status', '#updatedAt': 'updatedAt' };
+  const values = { ':to': to, ':updatedAt': new Date().toISOString() };
+  const sets = ['#status = :to', '#updatedAt = :updatedAt'];
+
+  // An undefined value must never reach the expression. Naming a placeholder in the SET clause and
+  // then leaving it out of ExpressionAttributeValues is a ValidationException, so the value decides
+  // whether the assignment exists at all — and the guard sits here rather than at each of the four
+  // call sites, none of which currently passes undefined but any of which easily could.
+  for (const [key, value] of Object.entries(extra)) {
+    if (value === undefined) continue;
+    names[`#${key}`] = key;
+    values[`:${key}`] = value;
+    sets.push(`#${key} = :${key}`);
+  }
+
+  let condition;
+  if (Array.isArray(from)) {
+    const placeholders = from
+      .filter((value) => value !== undefined)
+      .map((value, index) => {
+        values[`:from${index}`] = value;
+        return `:from${index}`;
+      });
+    if (placeholders.length === 0) {
+      throw new Error('transition needs at least one from-status');
+    }
+    condition = `#status IN (${placeholders.join(', ')})`;
+  } else {
+    values[':from'] = from;
+    condition = '#status = :from';
+  }
+
+  try {
+    const { Attributes } = await ddb.send(
+      new UpdateCommand({
+        TableName: env.table,
+        Key: { id },
+        UpdateExpression: `SET ${sets.join(', ')}`,
+        ConditionExpression: condition,
+        ExpressionAttributeNames: names,
+        ExpressionAttributeValues: values,
+        ReturnValues: 'ALL_NEW',
+      })
+    );
+    return Attributes;
+  } catch (error) {
+    if (error.name === 'ConditionalCheckFailedException') return undefined;
+    throw error;
+  }
+}
+
+export async function queryByPolicy(policyId) {
+  const { Items = [] } = await ddb.send(
+    new QueryCommand({
+      TableName: env.table,
+      IndexName: 'byPolicy',
+      KeyConditionExpression: 'policyId = :policyId',
+      ExpressionAttributeValues: { ':policyId': policyId },
+    })
+  );
+  return Items;
+}
+
+export async function queryByStatus(status) {
+  const { Items = [] } = await ddb.send(
+    new QueryCommand({
+      TableName: env.table,
+      IndexName: 'byStatus',
+      KeyConditionExpression: '#status = :status',
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: { ':status': status },
+    })
+  );
+  return Items;
+}
+
+export async function scanRows() {
+  const { Items = [] } = await ddb.send(
+    new ScanCommand({ TableName: env.table })
+  );
+  return Items.filter((item) => !String(item.id).startsWith('__'));
+}
+
+/** The PoC's own demo switches, kept in the table so the UI can flip them with no redeploy. */
+export async function getConfig() {
+  const item = await getRow(CONFIG_ID);
+  return { breakTarget: false, ...(item ?? {}) };
+}
+
+export async function setConfig(patch) {
+  const current = await getConfig();
+  const next = { ...current, ...patch, id: CONFIG_ID };
+  await putRow(next);
+  return next;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Recurrence — the part that must not drift from the old service
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Line-for-line services/schedule/src/schedule/processors/calculateNextTriggerDate.ts.
+ *
+ * Two modes, and the difference matters: with `processingData` the next date is
+ * `beginAt + period × (counter + 1)`, so a chain of twelve monthly fires lands on the same day of
+ * the month every time. Without it the period is added to the *last* trigger, which accumulates
+ * every rounding a month-length change introduces. Same luxon version does the arithmetic, so a
+ * `P1M` added to 31 January clamps exactly as production clamps it.
+ */
+export function calculateNextTriggerDate(row) {
+  const { period, triggerAt, processingData } = row;
+
+  if (processingData !== undefined && processingData !== null) {
+    const { beginAt, counter } = processingData;
+    const duration = Duration.fromISO(period).mapUnits(
+      (x) => x * (counter + 1)
+    );
+    return DateTime.fromISO(String(beginAt)).plus(duration).toISO() ?? '';
+  }
+
+  const duration = Duration.fromISO(period);
+  return DateTime.fromISO(String(triggerAt)).plus(duration).toISO() ?? '';
+}
+
+/**
+ * The `endAt` gate, reproduced including its day granularity.
+ *
+ * The old service compares `endAt.startOf('day') > next.endOf('day')`, so an `endAt` falling on the
+ * same calendar day as the next trigger stops the chain even when the clock time would allow one
+ * more fire. Written out rather than tidied, because a caller's chain length depends on it.
+ */
+export function shouldCreateNext(endAt, nextTriggerAt) {
+  if (endAt === undefined || endAt === null) return true;
+  return (
+    DateTime.fromISO(String(endAt)).startOf('day') >
+    DateTime.fromISO(String(nextTriggerAt)).endOf('day')
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Outbound envelope
+// ---------------------------------------------------------------------------------------------
+
+export const isFifo = (topicName) =>
+  typeof topicName === 'string' && topicName.endsWith('.fifo');
+
+/** A row with no `messageTopicName` is a V2 row and carries its own `message` verbatim. */
+export const isV2Row = (row) =>
+  row.messageTopicName === undefined || row.messageTopicName === null;
+
+/**
+ * V1 envelope. The schedule service mints the caller's authorization itself — no inbound token is
+ * carried through the wait — and drops `partnerId` out of the context in the process, moving it to
+ * `scopePartnerId`. Anything consuming a fired V1 schedule depends on this exact shape.
+ */
+export function buildV1Message(row) {
+  const { partnerId, ...rest } = row.context ?? {};
+
+  return {
+    topicName: row.messageTopicName,
+    payload: {
+      authorizationData: {
+        appKey: APP_KEY,
+        userId: null,
+        partnerId: null,
+        customerId: null,
+        agentId: null,
+        permissions: PERMISSIONS,
+        testingFlags: [],
+        roles: [ROLE_ALTEOS_SERVICE],
+        scopePartnerId: partnerId ?? null,
+        traceIds: {},
+        requestId: randomUUID(),
+      },
+      ...rest,
+    },
+    messageGroupId: isFifo(row.messageTopicName)
+      ? row.context?.policyId
+      : undefined,
+  };
+}
+
+/**
+ * Publish, standing in for `MessageBrokerClient`. A FIFO topic name routes to the FIFO queue with
+ * `messageGroupId` set, which is how the old service preserves per-policy ordering; everything else
+ * goes to the standard queue.
+ */
+export async function publish({ topicName, payload, messageGroupId }) {
+  const fifo = isFifo(topicName);
+  await sqs.send(
+    new SendMessageCommand({
+      QueueUrl: fifo ? env.fifoQueueUrl : env.queueUrl,
+      MessageBody: JSON.stringify({ topicName, payload }),
+      ...(fifo
+        ? {
+            MessageGroupId: messageGroupId ?? 'default',
+            MessageDeduplicationId: randomUUID(),
+          }
+        : {}),
+    })
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// EventBridge Scheduler — the timer, and only the timer
+// ---------------------------------------------------------------------------------------------
+
+export const scheduleNameFor = (id) => `poc-schedule-${id}`;
+
+/**
+ * One one-shot schedule per pending occurrence.
+ *
+ * `ConflictException` is answered rather than thrown: a repeated CreateSchedule under an existing
+ * name does not overwrite, so the conflict is proof the first attempt landed. Measured on
+ * 07.09.2026 — see docs/consistency.md. A `ClientToken` changes nothing here and is not sent.
+ */
+export async function createSchedule(row) {
+  const name = scheduleNameFor(row.id);
+
+  // A repair re-creates the timer for an occurrence whose own `triggerAt` has already passed, and
+  // `at()` in the past is not a shape Scheduler is documented to accept. The floor keeps the repair
+  // honest and observable: the fire happens a minute from now rather than silently never. How
+  // Scheduler actually answers a past `at()` is one of the things this PoC measures — see DEMO.md.
+  const wanted = DateTime.fromISO(String(row.triggerAt)).toUTC();
+  const floor = DateTime.utc().plus({ seconds: 60 });
+
+  // Second precision, formatted explicitly. Scheduler rejects an `at()` carrying fractional
+  // seconds — `Invalid Schedule Expression at(2026-09-08T03:54:26.439)` — and luxon's
+  // `suppressMilliseconds` only drops them when they happen to be zero, so it is not a fix.
+  const at = (wanted > floor ? wanted : floor).toFormat("yyyy-MM-dd'T'HH:mm:ss");
+
+  try {
+    await scheduler.send(
+      new CreateScheduleCommand({
+        Name: name,
+        GroupName: env.group,
+        ScheduleExpression: `at(${at})`,
+        ScheduleExpressionTimezone: 'UTC',
+        FlexibleTimeWindow: { Mode: 'OFF' },
+        ActionAfterCompletion: 'DELETE',
+        Target: {
+          Arn: env.functionArn,
+          RoleArn: env.schedulerRoleArn,
+          Input: JSON.stringify({ scheduleId: row.id }),
+        },
+      })
+    );
+    return { created: true, name };
+  } catch (error) {
+    if (error.name === 'ConflictException') return { created: false, name };
+    throw error;
+  }
+}
+
+export async function deleteSchedule(id) {
+  try {
+    await scheduler.send(
+      new DeleteScheduleCommand({
+        Name: scheduleNameFor(id),
+        GroupName: env.group,
+      })
+    );
+    return true;
+  } catch (error) {
+    if (error.name === 'ResourceNotFoundException') return false;
+    throw error;
+  }
+}
+
+export async function scheduleExists(id) {
+  try {
+    await scheduler.send(
+      new GetScheduleCommand({
+        Name: scheduleNameFor(id),
+        GroupName: env.group,
+      })
+    );
+    return true;
+  } catch (error) {
+    if (error.name === 'ResourceNotFoundException') return false;
+    throw error;
+  }
+}
+
+export async function listSchedules() {
+  const names = [];
+  let token;
+  do {
+    const page = await scheduler.send(
+      new ListSchedulesCommand({
+        GroupName: env.group,
+        NextToken: token,
+        MaxResults: 100,
+      })
+    );
+    for (const item of page.Schedules ?? []) names.push(item.Name);
+    token = page.NextToken;
+  } while (token);
+  return names;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Inbound validation — ported from the Joi schemas, same fields, same required-ness
+// ---------------------------------------------------------------------------------------------
+
+const isIsoDate = (value) =>
+  typeof value === 'string' && DateTime.fromISO(value).isValid;
+const isUuid = (value) => typeof value === 'string' && UUID_REGEX.test(value);
+const isPlainObject = (value) =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/** POST /v1/schedule — an array, and `context` needs command/partnerId/policyId. */
+export function validateCreateV1(body) {
+  const errors = [];
+  if (!Array.isArray(body)) return ['body must be an array'];
+
+  body.forEach((item, index) => {
+    const at = (message) => errors.push(`[${index}] ${message}`);
+    if (!isPlainObject(item)) return at('must be an object');
+    if (!isIsoDate(item.triggerAt)) at('triggerAt must be an ISO date');
+    if (item.endAt !== undefined && !isIsoDate(item.endAt))
+      at('endAt must be an ISO date');
+    if (item.period !== undefined && !PERIOD_REGEX.test(String(item.period)))
+      at('period must be an ISO 8601 duration');
+    if (typeof item.messageTopicName !== 'string' || item.messageTopicName === '')
+      at('messageTopicName is required');
+    if (!isPlainObject(item.context)) return at('context is required');
+    // `command` is a plain string here, not required — matches baseContextSchema.
+    if (item.context.command !== undefined && typeof item.context.command !== 'string')
+      at('context.command must be a string');
+    if (!isUuid(item.context.partnerId)) at('context.partnerId must be a uuid');
+    if (!isUuid(item.context.policyId)) at('context.policyId must be a uuid');
+  });
+
+  return errors;
+}
+
+/** POST /v2/schedule — `message` and `context` are opaque objects, both required. */
+export function validateCreateV2(body) {
+  const errors = [];
+  if (!Array.isArray(body)) return ['body must be an array'];
+
+  body.forEach((item, index) => {
+    const at = (message) => errors.push(`[${index}] ${message}`);
+    if (!isPlainObject(item)) return at('must be an object');
+    if (!isPlainObject(item.message)) at('message is required');
+    if (!isIsoDate(item.triggerAt)) at('triggerAt must be an ISO date');
+    if (item.endAt !== undefined && !isIsoDate(item.endAt))
+      at('endAt must be an ISO date');
+    if (item.period !== undefined && !PERIOD_REGEX.test(String(item.period)))
+      at('period must be an ISO 8601 duration');
+    if (!isPlainObject(item.context)) at('context is required');
+  });
+
+  return errors;
+}
+
+/**
+ * POST /v1/schedule/cancel — `commands` is required, and every *other* key in the body is a
+ * criterion matched against `context.<key>`. The schema allows unknown keys deliberately, so a
+ * validator that rejected them would break every caller.
+ */
+export function validateCancel(body) {
+  if (!isPlainObject(body)) return ['body must be an object'];
+  if (!Array.isArray(body.commands) || body.commands.length < 1)
+    return ['commands must be a non-empty array'];
+  if (!body.commands.every((command) => typeof command === 'string'))
+    return ['commands must be strings'];
+  return [];
+}
+
+export function validateActivate(body) {
+  if (!isPlainObject(body)) return ['body must be an object'];
+  if (!Array.isArray(body.scheduledActionIds))
+    return ['scheduledActionIds must be an array'];
+  if (!body.scheduledActionIds.every((id) => typeof id === 'string'))
+    return ['scheduledActionIds must be strings'];
+  return [];
+}
+
+/** GET /v1/schedule — note `policyId` is only `string().required()` here, not a uuid. */
+export function validateGet(query) {
+  const errors = [];
+  if (typeof query.policyId !== 'string' || query.policyId === '')
+    errors.push('policyId is required');
+  // API Gateway collapses a repeated query parameter into one comma-joined value, so
+  // `?statuses=pending&statuses=executed` arrives as the string "pending,executed". Splitting has
+  // to happen before the enum check or every multi-status read is rejected.
+  for (const status of splitStatuses(query.statuses))
+    if (!Object.values(STATUS).includes(status))
+      errors.push(`unknown status ${status}`);
+  return errors;
+}
+
+export function validateCancelPolicy(query) {
+  return isUuid(query.policyId) ? [] : ['policyId must be a uuid'];
+}
+
+export const splitStatuses = (value) =>
+  asArray(value)
+    .flatMap((item) => String(item).split(','))
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+export const asArray = (value) =>
+  value === undefined || value === null
+    ? []
+    : Array.isArray(value)
+      ? value
+      : [value];
+
+// ---------------------------------------------------------------------------------------------
+// Row construction
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * `policyId` is lifted out of `context` onto the item so the byPolicy index has a key. The old
+ * service queries `context.policyId` inside a JSONB column, which DynamoDB cannot index — this is
+ * the one shape change the move to DynamoDB forces, and every read path uses the lifted copy.
+ */
+export function newRow(input, { v2 }) {
+  const now = new Date().toISOString();
+  const triggerAt = DateTime.fromISO(String(input.triggerAt)).toUTC().toISO();
+
+  /**
+   * `__waitForApproval` in the context parks the row at `waitingExecutionApproval` instead of
+   * `pending`, which is what `POST /v1/schedule/activate` later releases. V1 only — the V2 handler
+   * always creates `pending`, so the same flag in a V2 context is silently ignored by the service
+   * being replaced. Reproduced, not corrected.
+   */
+  const waitForApproval = !v2 && input.context?.__waitForApproval === true;
+
+  return {
+    id: randomUUID(),
+    policyId: input.context?.policyId ?? 'unknown',
+    context: input.context ?? {},
+    ...(v2
+      ? { message: input.message }
+      : { messageTopicName: input.messageTopicName }),
+    status: waitForApproval ? STATUS.WaitingExecutionApproval : STATUS.Pending,
+    period: input.period ?? null,
+    triggerAt,
+    endAt: input.endAt
+      ? DateTime.fromISO(String(input.endAt)).toUTC().toISO()
+      : undefined,
+    /**
+     * Both create handlers guard this with `item.period !== null`, and an absent `period` is
+     * `undefined`, not `null` — so a one-shot action created without the key still gets a
+     * `processingData` block. Harmless, and copied so a row written here is byte-comparable with a
+     * row the old service would have written.
+     */
+    processingData:
+      input.period !== null ? { beginAt: input.triggerAt, counter: 0 } : undefined,
+    /** From the caller's authorizationData in the old service; the PoC runs no ACL, so from the item. */
+    testingFlags: v2 ? undefined : input.testingFlags,
+    attempts: 0,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------
+// The atomic chain step
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Mark the fired occurrence `executed` and write the next one in a single transaction.
+ *
+ * This is the one place the PoC deliberately does NOT copy the old service, and the reason the
+ * whole exercise exists. `executeScheduledActions` marks the row executed, *then* creates the next
+ * occurrence, with both calls inside one `try/catch` that only logs. Anything that throws between
+ * the two — a DB blip, or the `processObligation` branch reading
+ * `concludePolicyScheduleAction[0].triggerAt` when no conclude schedule exists — leaves the row
+ * `executed` and the chain permanently dead, visible as a single log line and nothing else.
+ *
+ * Both writes land or neither does, so there is no window in which the chain can end silently.
+ */
+export async function commitChainStep(row, next) {
+  const now = new Date().toISOString();
+
+  const items = [
+    {
+      Update: {
+        TableName: env.table,
+        Key: { id: row.id },
+        UpdateExpression: 'SET #status = :executed, #updatedAt = :now',
+        ConditionExpression: '#status = :processing',
+        ExpressionAttributeNames: { '#status': 'status', '#updatedAt': 'updatedAt' },
+        ExpressionAttributeValues: {
+          ':executed': STATUS.Executed,
+          ':processing': STATUS.Processing,
+          ':now': now,
+        },
+      },
+    },
+  ];
+
+  if (next) {
+    items.push({
+      Put: {
+        TableName: env.table,
+        Item: next,
+        ConditionExpression: 'attribute_not_exists(id)',
+      },
+    });
+  }
+
+  await ddb.send(new TransactWriteCommand({ TransactItems: items }));
+}
+
+/** The old ordering, kept behind a switch so one system can demonstrate both. */
+export async function commitChainStepLegacy(row, next, { breakNext }) {
+  await transition(row.id, STATUS.Processing, STATUS.Executed);
+  if (breakNext) {
+    // Exactly what the old service's catch block does with a throw from createScheduledActions:
+    // swallow it. The row is already `executed`, so nothing will ever fire for this policy again.
+    return { swallowed: 'next occurrence write failed and was only logged' };
+  }
+  if (next) await putRow(next);
+  return {};
+}
+
+// ---------------------------------------------------------------------------------------------
+// The observable feeds
+// ---------------------------------------------------------------------------------------------
+
+export const FEED_FIRED = '__fired';
+export const FEED_DLQ = '__dlq';
+
+/** Keeps a demo readable without keeping a queue's worth of history in one item. */
+const FEED_CAP = 40;
+
+/**
+ * Move whatever is on a queue into a feed row, so the UI has something durable to show.
+ *
+ * A queue is a bad display surface — a message read for the screen is gone for everyone else — so
+ * each poll drains the queue once and appends to an item the UI can re-read as often as it likes.
+ */
+export async function drainQueue(queueUrl, feedId) {
+  const received = [];
+
+  for (let round = 0; round < 3; round += 1) {
+    const { Messages = [] } = await sqs.send(
+      new ReceiveMessageCommand({
+        QueueUrl: queueUrl,
+        MaxNumberOfMessages: 10,
+        WaitTimeSeconds: 0,
+        MessageAttributeNames: ['All'],
+      })
+    );
+    if (Messages.length === 0) break;
+
+    for (const message of Messages) {
+      received.push({
+        at: new Date().toISOString(),
+        body: safeParse(message.Body),
+      });
+      await sqs.send(
+        new DeleteMessageCommand({
+          QueueUrl: queueUrl,
+          ReceiptHandle: message.ReceiptHandle,
+        })
+      );
+    }
+  }
+
+  if (received.length === 0) return readFeed(feedId);
+
+  const existing = await readFeed(feedId);
+  const items = [...received, ...existing].slice(0, FEED_CAP);
+  await putRow({ id: feedId, items });
+  return items;
+}
+
+export async function readFeed(feedId) {
+  const row = await getRow(feedId);
+  return row?.items ?? [];
+}
+
+function safeParse(body) {
+  try {
+    return JSON.parse(body);
+  } catch {
+    return { unparsed: String(body).slice(0, 2000) };
+  }
+}
+
+export async function deleteRow(id) {
+  await ddb.send(new DeleteCommand({ TableName: env.table, Key: { id } }));
+}
+
+/**
+ * An unconditional status write, which is what `POST /v1/schedule/activate` does.
+ *
+ * The old handler updates by `id IN (...)` with no status predicate, so activating an id that is
+ * already `cancelled` or `executed` puts it back to `pending` and it fires again. Reproduced
+ * because a caller may well be relying on it; flagged because it is almost certainly not intended.
+ */
+export async function forceStatus(id, to) {
+  const { Attributes } = await ddb.send(
+    new UpdateCommand({
+      TableName: env.table,
+      Key: { id },
+      UpdateExpression: 'SET #status = :to, #updatedAt = :now',
+      ConditionExpression: 'attribute_exists(id)',
+      ExpressionAttributeNames: { '#status': 'status', '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: { ':to': to, ':now': new Date().toISOString() },
+      ReturnValues: 'ALL_NEW',
+    })
+  ).catch((error) => {
+    if (error.name === 'ConditionalCheckFailedException') return {};
+    throw error;
+  });
+  return Attributes;
+}

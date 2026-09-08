@@ -1,0 +1,16 @@
+{
+  "name": "poc-schedule-lambda",
+  "private": true,
+  "type": "module",
+  "description": "PoC only, throwaway. luxon is here on purpose: the service being replaced computes every recurrence with luxon, so sharing the library removes any chance the dates differ for a reason nobody can see. The AWS clients are pinned into the zip rather than taken from the runtime, so a runtime bump cannot change what the demo does.",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.700.0",
+    "@aws-sdk/client-scheduler": "^3.700.0",
+    "@aws-sdk/client-sqs": "^3.700.0",
+    "@aws-sdk/lib-dynamodb": "^3.700.0",
+    "luxon": "^3.5.0"
+  }
+}
