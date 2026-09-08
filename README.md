@@ -79,6 +79,42 @@ hand, or move the state to an S3 backend. For a PoC, copying it is the honest an
 
 `node src/test.mjs` needs neither AWS nor Terraform and runs anywhere.
 
+### A different IAM user in the same account
+
+Nothing in the stack is tied to whoever created it. `data.aws_caller_identity` is read only for the
+account id, no resource policy names a human principal — the only principals are
+`scheduler.amazonaws.com` and `lambda.amazonaws.com` — and the account guard checks the account,
+not the user. So a second IAM user in the same account is fine; the only question is what that user
+is allowed to do.
+
+**To watch the running stack**, one permission is the whole requirement. Everything else happens
+inside the function under the function's own role:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WatchTheSchedulePoc",
+      "Effect": "Allow",
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:eu-central-1:<account>:function:poc-schedule"
+    }
+  ]
+}
+```
+
+**To run Terraform**, the user needs create-and-delete on `dynamodb`, `sqs`, `scheduler`, `lambda`,
+`logs`, and — the part that is easy to miss — `iam:CreateRole`, `iam:PutRolePolicy` and
+`iam:PassRole` on both `poc-schedule-role` and `poc-schedule-scheduler-role`. A user without
+`iam:PassRole` fails at the point the Lambda is created, and the error names the action and the
+role. Writing a least-privilege policy for this is more work than the PoC is worth; an
+administrator user is the honest answer for a disposable sandbox.
+
+**One trap.** `terraform destroy` with no state file destroys nothing. It reports success, and the
+stack keeps running and keeps costing money. Whoever tears this down has to be the machine holding
+`infra/terraform.tfstate`, or has to have copied it across first.
+
 ### The account guard
 
 `expected_account_id` is passed to the provider's `allowed_account_ids`, so every AWS call fails
