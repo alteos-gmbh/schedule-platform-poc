@@ -181,7 +181,7 @@ day — so destroy the stack rather than leaving it idle for a week.
 | `infra/` | The stack. One `main.tf`, applied and destroyed locally |
 | `DEMO.md` / `DEMO.vi.md` | The demo script; the second is a Vietnamese translation of the first |
 | `proxy.mjs` | Browser fetch to one `lambda:Invoke`, using your credentials |
-| `ui/index.html` | The console |
+| `ui/index.html` | The console, including the log panel |
 
 ## Why there is a proxy and not a URL
 

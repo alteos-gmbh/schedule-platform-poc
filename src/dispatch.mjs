@@ -128,15 +128,38 @@ export async function dispatch(scheduleId, log) {
 
     return { fired: true, chainBroken: false, next: next?.id ?? null };
   } catch (error) {
-    // The row stays `processing` with the reason recorded, and the throw propagates so Lambda
-    // retries twice and then writes the failure to the DLQ through its event-invoke destination.
-    // Scheduler's own dead-letter queue would never see this: the invoke is asynchronous, so a
-    // function that runs and throws is a *delivered* fire as far as Scheduler is concerned.
-    await transition(row.id, STATUS.Processing, STATUS.Processing, {
-      attempts: (claimed.attempts ?? 0) + 1,
-      lastError: String(error.message).slice(0, 500),
+    /**
+     * The throw always propagates, because that is what makes Lambda retry and, on the last
+     * attempt, write the failure to the DLQ through its event-invoke destination. Scheduler's own
+     * dead-letter queue would never see any of this: the invoke is asynchronous, so a function that
+     * runs and throws is a *delivered* fire as far as Scheduler is concerned.
+     *
+     * What changes is where the row is left. Lambda does not tell a function which retry it is on,
+     * so the row counts for itself: on the final attempt it is parked at `failed` before the throw,
+     * which means the status flips in the same moment the dead-letter record appears rather than a
+     * reconciler tick later. Every earlier attempt leaves it `processing` to be retried.
+     */
+    const attempts = (claimed.attempts ?? 0) + 1;
+    const exhausted = attempts >= env.invocationsPerFiring;
+
+    await transition(
+      row.id,
+      STATUS.Processing,
+      exhausted ? STATUS.Failed : STATUS.Processing,
+      {
+        attempts,
+        lastError: String(error.message).slice(0, 500),
+        ...(exhausted ? { failedAt: new Date().toISOString() } : {}),
+      }
+    );
+
+    log('dispatch', exhausted ? 'fireGaveUp' : 'fireFailed', {
+      scheduleId,
+      attempt: attempts,
+      of: env.invocationsPerFiring,
+      reason: error.message,
     });
-    log('dispatch', 'fireFailed', { scheduleId, reason: error.message });
+
     throw error;
   }
 }
@@ -199,7 +222,9 @@ async function buildNextOccurrence(row, log) {
     triggerAt: nextTriggerAt,
     processingData,
     attempts: 0,
+    deliveries: 1,
     lastError: undefined,
+    failedAt: undefined,
     createdAt: now,
     updatedAt: now,
   };
@@ -246,28 +271,69 @@ export async function reconcile(log) {
     log('reconciler', 'orphanDeleted', { name });
   }
 
+  /**
+   * A row stuck in `processing` past the TTL has had its firing exhausted — Lambda retried it twice
+   * and wrote a dead-letter record. The question is whether to fire it again.
+   *
+   * The old service always did, with no cap, which is an unbounded loop against a permanently
+   * broken target: one dead-letter record per cycle, for ever. Here the row gets
+   * `max_delivery_attempts` firings and then stops at `failed`, which is terminal — nothing
+   * re-fires it and no timer is created. Recovering one is a deliberate act, not a side effect.
+   */
   const cutoff = DateTime.utc().minus({ minutes: env.processingTtlMinutes });
   let unstuck = 0;
+  let failed = 0;
+
   for (const row of processing) {
     if (DateTime.fromISO(String(row.updatedAt)) > cutoff) continue;
-    const back = await transition(row.id, STATUS.Processing, STATUS.Pending);
+
+    const used = row.deliveries ?? 1;
+
+    if (used >= env.maxDeliveryAttempts) {
+      const done = await transition(row.id, STATUS.Processing, STATUS.Failed, {
+        failedAt: new Date().toISOString(),
+      });
+      if (!done) continue;
+      failed += 1;
+      log('reconciler', 'gaveUp', {
+        scheduleId: row.id,
+        deliveries: used,
+        attempts: row.attempts ?? 0,
+        lastError: row.lastError ?? null,
+      });
+      continue;
+    }
+
+    const back = await transition(row.id, STATUS.Processing, STATUS.Pending, {
+      deliveries: used + 1,
+    });
     if (!back) continue;
     await createSchedule(back);
     unstuck += 1;
     log('reconciler', 'unstuck', {
       scheduleId: row.id,
+      delivery: used + 1,
+      of: env.maxDeliveryAttempts,
       attempts: row.attempts ?? 0,
       lastError: row.lastError ?? null,
     });
   }
 
-  return {
+  const result = {
     repaired,
     orphansDeleted,
     unstuck,
+    failed,
     pending: pending.length,
     processing: processing.length,
   };
+
+  // Logged on every tick, including the quiet ones. A reconciler that only speaks when it repairs
+  // something is indistinguishable from a reconciler that is not running at all, and "is it even
+  // running" is the first thing anyone watching a repair demo wants to know.
+  log('reconciler', 'tick', result);
+
+  return result;
 }
 
 async function deleteScheduleByName(name) {

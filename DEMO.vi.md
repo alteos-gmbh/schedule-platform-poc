@@ -6,6 +6,8 @@ Mười một hành vi cần bao phủ và mười một thứ cần cho xem. M�
 
 Chạy console (`npm run console`), mở <http://localhost:8787>, bấm **reset everything**.
 
+Form tạo chỉ hiện những gì cả phòng cần theo dõi: bắn khi nào, bao lâu một lần, thuộc policy nào. Shape, `messageTopicName` và `context.command` vẫn còn và vẫn điều khiển lệnh gọi, chỉ là ẩn đi — mỗi field hiện ra là một thứ nữa phải giải thích. Panel bên phải là log của chính function, nên dòng log làm đổi một row nằm ngay cạnh row đó.
+
 ---
 
 ## Bề mặt inbound đang được thay thế

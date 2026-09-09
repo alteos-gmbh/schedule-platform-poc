@@ -132,8 +132,25 @@
       .s-executed { color: var(--ok); }
       .s-cancelled { color: var(--muted); }
       .s-waitingExecutionApproval { color: var(--warn); }
+      .s-failed { color: var(--bad); }
       .flag { color: var(--bad); font-size: 11px; font-weight: 600; }
       .feed { margin: 0; padding: 0; list-style: none; max-height: 320px; overflow-y: auto; }
+      .feed.tall { max-height: 560px; }
+      .split { display: grid; gap: 20px; grid-template-columns: 1fr; min-width: 0; }
+      .stack { display: grid; gap: 20px; align-content: start; min-width: 0; }
+      @media (min-width: 1100px) {
+        .split { grid-template-columns: 1fr 1fr; }
+      }
+      .log-kind {
+        display: inline-block;
+        min-width: 84px;
+        font-weight: 600;
+      }
+      .log-dispatch { color: var(--accent); }
+      .log-reconciler { color: var(--ok); }
+      .log-api { color: var(--muted); }
+      .log-report { color: var(--muted); }
+      .log-bad { color: var(--bad); }
       .feed li { border-bottom: 1px solid var(--line); padding: 7px 0; font-family: var(--mono); font-size: 12px; }
       .feed time { color: var(--muted); }
       .empty { color: var(--muted); font-style: italic; font-size: 13px; }
@@ -160,7 +177,17 @@
       <section class="wide">
         <h2>Create a schedule</h2>
         <div class="grid">
-          <div>
+          <!--
+            Hidden, not removed. The values still drive the create call; they are out of the way
+            because a room does not need to see them to follow what the platform does, and every
+            visible field is one more thing a presenter has to explain.
+
+            The topic and command defaults are the inert pair on purpose: `processObligation` sends
+            the dispatcher into its conclude-sibling lookup, which logs
+            `processObligationWithoutConclude` on every fire and reads as an error in the log panel
+            when it is nothing of the kind.
+          -->
+          <div hidden>
             <label for="version">shape</label>
             <select id="version">
               <option value="v1">v1 — messageTopicName + context</option>
@@ -179,13 +206,13 @@
             <label for="endAt">endAt (blank = never ends)</label>
             <input id="endAt" placeholder="2026-09-09T00:00:00.000Z" />
           </div>
-          <div>
+          <div hidden>
             <label for="topic">messageTopicName</label>
-            <input id="topic" value="policy-obligations" />
+            <input id="topic" value="accounting-jobs" />
           </div>
-          <div>
+          <div hidden>
             <label for="command">context.command</label>
-            <input id="command" value="processObligation" />
+            <input id="command" value="processCollection" />
           </div>
           <div>
             <label for="policyId">context.policyId</label>
@@ -234,19 +261,34 @@
         </div>
       </section>
 
-      <section>
-        <h2>Timers in EventBridge Scheduler</h2>
-        <ul class="feed" id="timers">
-          <li class="empty">nothing yet</li>
-        </ul>
-      </section>
+      <div class="split wide">
+        <div class="stack">
+          <section>
+            <h2>Timers in EventBridge Scheduler</h2>
+            <ul class="feed" id="timers">
+              <li class="empty">nothing yet</li>
+            </ul>
+          </section>
 
-      <section>
-        <h2>Dead letters — Lambda's failure destination</h2>
-        <ul class="feed" id="dlq">
-          <li class="empty">nothing yet</li>
-        </ul>
-      </section>
+          <section>
+            <h2>Dead letters — Lambda's failure destination</h2>
+            <ul class="feed" id="dlq">
+              <li class="empty">nothing yet</li>
+            </ul>
+          </section>
+        </div>
+
+        <section>
+          <h2>Lambda log — cause, beside the effect</h2>
+          <ul class="feed tall" id="logs">
+            <li class="empty">nothing yet</li>
+          </ul>
+          <p class="note">
+            Read from the function's own CloudWatch group. Ingestion lags a few seconds, so this
+            panel trails the table — that is the display being late, not the platform.
+          </p>
+        </section>
+      </div>
 
       <section class="wide">
         <h2>Fired — what actually reached the queue</h2>
@@ -356,7 +398,20 @@
       });
 
       // ---- render ---------------------------------------------------------------------------
-      function renderRows(rows, timers) {
+      /**
+       * Deliveries, not attempts. One delivery is a firing, and each firing is already three Lambda
+       * invocations, so the two numbers differ on purpose and the column would be unreadable
+       * without saying which is which.
+       */
+      function deliveryNote(row, limits) {
+        const used = row.deliveries ?? 1;
+        const max = limits?.maxDeliveryAttempts;
+        if (!max || row.status === 'executed' || row.status === 'cancelled') return '';
+        const exhausted = used >= max;
+        return `<pre${exhausted ? ' class="flag"' : ''}>delivery ${used}/${max}</pre>`;
+      }
+
+      function renderRows(rows, timers, limits) {
         const body = $('rows');
         if (rows.length === 0) {
           body.innerHTML = '<tr><td colspan="8" class="empty">nothing yet</td></tr>';
@@ -387,8 +442,8 @@
               <td class="mono">${row.processingData?.counter ?? '—'}</td>
               <td class="mono">${timerCell}</td>
               <td class="mono">${row.attempts ?? 0}${
-                row.lastError ? `<pre>${escapeHtml(row.lastError)}</pre>` : ''
-              }</td>
+                deliveryNote(row, limits)
+              }${row.lastError ? `<pre>${escapeHtml(row.lastError)}</pre>` : ''}</td>
               <td></td>`;
 
             const actions = tr.lastElementChild;
@@ -464,7 +519,7 @@
           for (const id of switchIds) $(id).checked = Boolean(data.config[id]);
         }
 
-        renderRows(data.rows, data.schedules);
+        renderRows(data.rows, data.schedules, data.limits);
 
         renderFeed('timers', data.schedules, (name) => escapeHtml(name));
 
@@ -477,6 +532,31 @@
             : '';
           return `<time>${escapeHtml(item.at)}</time> ${escapeHtml(topic)}${group}
             <pre>${escapeHtml(JSON.stringify(item.body?.payload ?? item.body).slice(0, 400))}</pre>`;
+        });
+
+        // Lines a viewer should read as trouble, so the panel does not make everything look equal.
+        const LOUD = new Set([
+          'chainBrokenSilently',
+          'fireFailed',
+          'fireGaveUp',
+          'gaveUp',
+          'orphanFire',
+          'unknownInvocationPayload',
+          'consoleError',
+        ]);
+
+        renderFeed('logs', data.logs, (item) => {
+          const loud = LOUD.has(item.text) || item.kind === 'consoleError';
+          const cls = loud
+            ? 'log-bad'
+            : `log-${['dispatch', 'reconciler', 'api', 'report'].includes(item.kind) ? item.kind : 'api'}`;
+          const clock = new Date(item.at).toISOString().slice(11, 19);
+          const detail = item.detail
+            ? `<pre>${escapeHtml(JSON.stringify(item.detail))}</pre>`
+            : '';
+          return `<time>${clock}</time> <span class="log-kind ${cls}">${escapeHtml(
+            item.kind
+          )}</span> ${escapeHtml(item.text)}${detail}`;
         });
 
         renderFeed('dlq', data.dlq, (item) => {

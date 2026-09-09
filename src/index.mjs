@@ -21,6 +21,7 @@ import {
   newRow,
   putRow,
   queryByPolicy,
+  readLogs,
   scanRows,
   setConfig,
   splitStatuses,
@@ -252,20 +253,28 @@ const ROUTES = {
     await drainQueue(env.queueUrl, FEED_FIRED);
     const fired = await drainQueue(env.fifoQueueUrl, FEED_FIRED);
 
-    const [rows, schedules, dlq, config] = await Promise.all([
+    const [rows, schedules, dlq, config, logs] = await Promise.all([
       scanRows(),
       listSchedules(),
       drainQueue(env.dlqUrl, FEED_DLQ),
       getConfig(),
+      readLogs(),
     ]);
 
     return json(200, {
       now: new Date().toISOString(),
       config,
+      limits: {
+        maxDeliveryAttempts: env.maxDeliveryAttempts,
+        invocationsPerFiring: env.invocationsPerFiring,
+        processingTtlMinutes: env.processingTtlMinutes,
+        minLeadSeconds: env.minLeadSeconds,
+      },
       rows: rows.sort((a, b) => String(a.triggerAt).localeCompare(b.triggerAt)),
       schedules,
       fired,
       dlq,
+      logs,
     });
   },
 

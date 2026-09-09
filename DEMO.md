@@ -7,6 +7,11 @@ and line behind it, so a disagreement in the room can be settled by opening the 
 
 Start the console (`npm run console`), open <http://localhost:8787>, press **reset everything**.
 
+The create form shows only what a room needs to follow: when it fires, how often, and the policy
+it belongs to. Shape, `messageTopicName` and `context.command` are still there and still drive the
+call, just hidden — every visible field is one more thing to explain. The right-hand panel is the
+function's own log, so the line that changed a row sits beside the row changing.
+
 ---
 
 ## The inbound surface being replaced

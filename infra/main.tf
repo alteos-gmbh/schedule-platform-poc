@@ -255,6 +255,14 @@ data "aws_iam_policy_document" "lambda" {
     resources = ["${aws_cloudwatch_log_group.schedule.arn}:*"]
   }
 
+  # The console shows the function's own log lines beside the rows they changed, so the function
+  # reads its own group back. Read-only, and scoped to that one group.
+  statement {
+    sid       = "ReadOwnLogsForTheDemo"
+    actions   = ["logs:FilterLogEvents"]
+    resources = ["${aws_cloudwatch_log_group.schedule.arn}:*"]
+  }
+
   statement {
     sid = "Store"
     actions = [
@@ -371,6 +379,11 @@ resource "aws_lambda_function" "schedule" {
       POC_FUNCTION_ARN           = "arn:aws:lambda:${var.region}:${local.account_id}:function:${local.fn_name}"
       POC_PROCESSING_TTL_MINUTES = tostring(var.processing_ttl_minutes)
       POC_MIN_LEAD_SECONDS       = tostring(var.min_lead_seconds)
+      POC_MAX_DELIVERY_ATTEMPTS  = tostring(var.max_delivery_attempts)
+      # Lambda never tells a function which retry it is on, so the function counts for itself and
+      # needs to know where the count ends.
+      POC_INVOCATIONS_PER_FIRING = tostring(var.lambda_retry_attempts + 1)
+      POC_LOG_GROUP              = aws_cloudwatch_log_group.schedule.name
       # Declared, not inherited. The endAt gate resolves startOf('day') in the process zone, and
       # the old service pins nothing — so the boundary silently follows whatever TZ the container
       # was started with. See the test in ../src/test.mjs.
@@ -392,7 +405,7 @@ resource "aws_lambda_function" "schedule" {
 # sqs:SendMessage on the function's role — both of which the RFC omits.
 resource "aws_lambda_function_event_invoke_config" "schedule" {
   function_name          = aws_lambda_function.schedule.function_name
-  maximum_retry_attempts = 2
+  maximum_retry_attempts = var.lambda_retry_attempts
 
   destination_config {
     on_failure {

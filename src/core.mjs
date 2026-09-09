@@ -29,6 +29,10 @@ import {
   SchedulerClient,
 } from '@aws-sdk/client-scheduler';
 import {
+  CloudWatchLogsClient,
+  FilterLogEventsCommand,
+} from '@aws-sdk/client-cloudwatch-logs';
+import {
   DeleteMessageCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
@@ -53,6 +57,14 @@ export const STATUS = Object.freeze({
   PreExecuted: 'preExecuted',
   Processing: 'processing',
   WaitingExecutionApproval: 'waitingExecutionApproval',
+  /**
+   * From the design, not from this PoC: docs/consistency.md has the dispatcher park a row here after
+   * a ceiling of exhausted firings, and terraform#608 indexes `byStatus` for "admin queries for
+   * `failed`". What the service being replaced lacks is the cap itself —
+   * `resetLockedScheduledActions` returns a stuck row to `pending` for ever, so a permanently broken
+   * target is retried until a human notices.
+   */
+  Failed: 'failed',
 });
 
 /** Character-for-character the regex in both create validation schemas. */
@@ -101,6 +113,25 @@ export const env = Object.freeze({
    * demo needs the clamp to be visible.
    */
   minLeadSeconds: Number(process.env.POC_MIN_LEAD_SECONDS ?? '10'),
+  logGroup: process.env.POC_LOG_GROUP ?? '',
+  /**
+   * How many times the platform will try to deliver one occurrence before giving up on it.
+   *
+   * A delivery is one firing, and each firing is already three Lambda invocations — the initial one
+   * plus `maximum_retry_attempts = 2` — ending in one dead-letter record. So this counts firings,
+   * not invocations. Confusing the two is easy: equal numbers hid the difference for a while during
+   * the DPT-10338 spike, and `attempts` on the row deliberately counts the other thing.
+   */
+  maxDeliveryAttempts: Number(process.env.POC_MAX_DELIVERY_ATTEMPTS ?? '1'),
+  /**
+   * Invocations in one firing: Lambda's `maximum_retry_attempts` plus the first call.
+   *
+   * The function needs this because Lambda does not tell it which retry it is on — there is no
+   * attempt index in the event or the context. So the row's own `attempts` is the counter, and this
+   * is where it ends. Getting it wrong in either direction is visible: too low and the row is
+   * parked before the dead-letter record exists, too high and it is never parked at all.
+   */
+  invocationsPerFiring: Number(process.env.POC_INVOCATIONS_PER_FIRING ?? '3'),
 });
 
 function required(name) {
@@ -114,6 +145,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
 });
 const scheduler = new SchedulerClient({});
 const sqs = new SQSClient({});
+const cwl = new CloudWatchLogsClient({});
 
 // ---------------------------------------------------------------------------------------------
 // Store
@@ -594,6 +626,8 @@ export function newRow(input, { v2 }) {
     /** From the caller's authorizationData in the old service; the PoC runs no ACL, so from the item. */
     testingFlags: v2 ? undefined : input.testingFlags,
     attempts: 0,
+    /** Firings used so far. The first one is this row's own, hence 1 rather than 0. */
+    deliveries: 1,
     createdAt: now,
     updatedAt: now,
   };
@@ -752,4 +786,100 @@ export async function forceStatus(id, to) {
     throw error;
   });
   return Attributes;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The function's own logs, read back for the console
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Recent log lines from this function's own log group.
+ *
+ * The console shows these so a demo can point at cause and effect in the same window — the row
+ * changing status on the left, the line that changed it on the right. It reads its own logs rather
+ * than the operator's machine reading CloudWatch, so the console keeps its single dependency and
+ * works unchanged behind a tunnel.
+ *
+ * CloudWatch ingestion lags by seconds, so the panel is always slightly behind the table. That is
+ * the display being late, not the platform.
+ */
+export async function readLogs({ minutes = 15, limit = 60 } = {}) {
+  if (!env.logGroup) return [];
+
+  try {
+    const { events = [] } = await cwl.send(
+      new FilterLogEventsCommand({
+        logGroupName: env.logGroup,
+        startTime: Date.now() - minutes * 60_000,
+        /**
+         * Filter server-side, and the reason matters. `FilterLogEvents` pages from the *oldest*
+         * event in the window with no way to ask for the newest, and the console polls this
+         * function every two seconds — so an unfiltered window of fifteen minutes is well over a
+         * thousand runtime START/END/REPORT lines and the first page never reaches anything the
+         * handler wrote.
+         *
+         * Every handler line is one JSON object carrying `component`, so matching that literal
+         * leaves only those. A plain substring pattern rather than the JSON `{ $.component = * }`
+         * form, because the runtime prefixes each line with a timestamp and request id and the
+         * event is therefore not valid JSON on its own.
+         */
+        filterPattern: '"component"',
+        limit: 200,
+      })
+    );
+
+    return events
+      .map((event) => shapeLogLine(event))
+      .filter(Boolean)
+      .sort((a, b) => b.at - a.at)
+      .slice(0, limit);
+  } catch (error) {
+    // A missing permission or a log group that does not exist yet must not take the whole console
+    // down with it — the panel says why instead.
+    return [
+      {
+        at: Date.now(),
+        kind: 'consoleError',
+        text: `could not read ${env.logGroup}: ${error.name}`,
+      },
+    ];
+  }
+}
+
+function shapeLogLine(event) {
+  const raw = String(event.message ?? '').trim();
+  if (!raw) return undefined;
+
+  /**
+   * The runtime's own framing, all of it dropped.
+   *
+   * REPORT looks tempting — duration and memory next to a fire — but the console polls this
+   * function every two seconds, so each poll writes its own START/END/REPORT. Keeping them means
+   * the panel is entirely the console watching itself, and the handful of lines that matter are
+   * pushed off the end within a minute. Everything below this point is something the handler chose
+   * to log.
+   */
+  if (
+    raw.startsWith('START ') ||
+    raw.startsWith('END ') ||
+    raw.startsWith('REPORT ') ||
+    raw.startsWith('INIT_START ')
+  ) {
+    return undefined;
+  }
+
+  // Anything the handler logged, which is always one JSON object per line.
+  const json = raw.slice(raw.indexOf('{'));
+  try {
+    const parsed = JSON.parse(json);
+    const { component, message, ...detail } = parsed;
+    return {
+      at: event.timestamp,
+      kind: component ?? 'log',
+      text: message ?? '',
+      detail: Object.keys(detail).length > 0 ? detail : undefined,
+    };
+  } catch {
+    return { at: event.timestamp, kind: 'raw', text: raw.slice(0, 300) };
+  }
 }
