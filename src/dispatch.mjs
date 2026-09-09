@@ -243,11 +243,15 @@ async function buildNextOccurrence(row, log) {
  *    `resetLockedScheduledActions` job did and the reason that job exists at all.
  */
 export async function reconcile(log) {
-  const [pending, processing, names] = await Promise.all([
+  const [pending, processing, names, config] = await Promise.all([
     queryByStatus(STATUS.Pending),
     queryByStatus(STATUS.Processing),
     listSchedules(),
+    getConfig(),
   ]);
+
+  // Read from the config row, not the environment, so the console can change it mid-demo.
+  const maxDeliveries = config.maxDeliveryAttempts ?? env.maxDeliveryAttempts;
 
   const live = new Set(names);
   const wanted = new Set(pending.map((row) => scheduleNameFor(row.id)));
@@ -289,7 +293,7 @@ export async function reconcile(log) {
 
     const used = row.deliveries ?? 1;
 
-    if (used >= env.maxDeliveryAttempts) {
+    if (used >= maxDeliveries) {
       const done = await transition(row.id, STATUS.Processing, STATUS.Failed, {
         failedAt: new Date().toISOString(),
       });
@@ -313,7 +317,7 @@ export async function reconcile(log) {
     log('reconciler', 'unstuck', {
       scheduleId: row.id,
       delivery: used + 1,
-      of: env.maxDeliveryAttempts,
+      of: maxDeliveries,
       attempts: row.attempts ?? 0,
       lastError: row.lastError ?? null,
     });

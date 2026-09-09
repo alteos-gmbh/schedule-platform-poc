@@ -265,7 +265,7 @@ const ROUTES = {
       now: new Date().toISOString(),
       config,
       limits: {
-        maxDeliveryAttempts: env.maxDeliveryAttempts,
+        maxDeliveryAttempts: config.maxDeliveryAttempts ?? env.maxDeliveryAttempts,
         invocationsPerFiring: env.invocationsPerFiring,
         processingTtlMinutes: env.processingTtlMinutes,
         minLeadSeconds: env.minLeadSeconds,
@@ -279,11 +279,26 @@ const ROUTES = {
   },
 
   'POST /_debug/config': async ({ body, log }) => {
-    const config = await setConfig({
-      breakTarget: Boolean(body?.breakTarget),
-      breakNext: Boolean(body?.breakNext),
-      legacyChain: Boolean(body?.legacyChain),
-    });
+    // Clamped rather than validated into an error: this is a demo control, and a cap of 40 on a
+    // shared stack means a broken target loops for forty firings while everyone watches.
+    const cap = Math.min(
+      5,
+      Math.max(1, Math.trunc(Number(body?.maxDeliveryAttempts)) || 1)
+    );
+
+    /**
+     * Only what the body actually names. Building a full patch with defaults for the rest meant a
+     * call setting one field silently cleared the others — a `curl` that changed the cap turned
+     * `break publish` off, which during a demo looks like the platform recovering on its own.
+     * The console sends all four, so nothing there changes.
+     */
+    const patch = {};
+    for (const key of ['breakTarget', 'breakNext', 'legacyChain']) {
+      if (body?.[key] !== undefined) patch[key] = Boolean(body[key]);
+    }
+    if (body?.maxDeliveryAttempts !== undefined) patch.maxDeliveryAttempts = cap;
+
+    const config = await setConfig(patch);
     log('debug', 'configChanged', config);
     return json(200, config);
   },

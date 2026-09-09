@@ -166,6 +166,17 @@
         <label><input type="checkbox" id="breakTarget" /> break publish</label>
         <label><input type="checkbox" id="breakNext" /> break chain write</label>
         <label><input type="checkbox" id="legacyChain" /> legacy ordering</label>
+        <label>
+          delivery cap
+          <input
+            type="number"
+            id="deliveryCap"
+            min="1"
+            max="5"
+            style="width: 56px"
+            title="How many firings one occurrence gets before the reconciler parks it at failed. One firing is up to three Lambda invocations."
+          />
+        </label>
       </div>
       <div class="row">
         <button id="reconcile">reconcile now</button>
@@ -372,17 +383,20 @@
       const switchIds = ['breakTarget', 'breakNext', 'legacyChain'];
       let applyingSwitches = false;
 
-      for (const id of switchIds) {
-        $(id).addEventListener('change', async () => {
-          applyingSwitches = true;
-          await api('POST', '/_debug/config', {
-            breakTarget: $('breakTarget').checked,
-            breakNext: $('breakNext').checked,
-            legacyChain: $('legacyChain').checked,
-          });
-          applyingSwitches = false;
-          refresh();
+      const pushConfig = async () => {
+        applyingSwitches = true;
+        await api('POST', '/_debug/config', {
+          breakTarget: $('breakTarget').checked,
+          breakNext: $('breakNext').checked,
+          legacyChain: $('legacyChain').checked,
+          maxDeliveryAttempts: Number($('deliveryCap').value),
         });
+        applyingSwitches = false;
+        refresh();
+      };
+
+      for (const id of [...switchIds, 'deliveryCap']) {
+        $(id).addEventListener('change', pushConfig);
       }
 
       $('reconcile').addEventListener('click', async () => {
@@ -517,6 +531,10 @@
 
         if (!applyingSwitches) {
           for (const id of switchIds) $(id).checked = Boolean(data.config[id]);
+          // Left alone while it has focus, or a poll rewrites the number mid-edit.
+          if (document.activeElement !== $('deliveryCap')) {
+            $('deliveryCap').value = data.limits.maxDeliveryAttempts;
+          }
         }
 
         renderRows(data.rows, data.schedules, data.limits);

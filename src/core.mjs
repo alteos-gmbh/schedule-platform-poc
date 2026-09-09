@@ -254,10 +254,23 @@ export async function scanRows() {
   return Items.filter((item) => !String(item.id).startsWith('__'));
 }
 
-/** The PoC's own demo switches, kept in the table so the UI can flip them with no redeploy. */
+/**
+ * The PoC's own demo switches, kept in the table so the UI can flip them with no redeploy.
+ *
+ * `maxDeliveryAttempts` lives here rather than only in the environment because changing it is part
+ * of the demo — showing one firing and then showing two is the whole point of the setting, and a
+ * Terraform apply between the two would break the thread of the argument. The environment variable
+ * is the default this falls back to, so a reset returns to whatever the stack was deployed with.
+ */
 export async function getConfig() {
-  const item = await getRow(CONFIG_ID);
-  return { breakTarget: false, ...(item ?? {}) };
+  const item = (await getRow(CONFIG_ID)) ?? {};
+  return {
+    breakTarget: false,
+    breakNext: false,
+    legacyChain: false,
+    maxDeliveryAttempts: env.maxDeliveryAttempts,
+    ...item,
+  };
 }
 
 export async function setConfig(patch) {
