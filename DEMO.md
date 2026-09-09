@@ -63,10 +63,30 @@ on `03-31` rather than `03-28`. Behaviour 1.
 The same test shows behaviour 3: the same two instants read in UTC+7 give a different answer, so
 the old service's chain length depends on the container's `TZ`. The PoC's Lambda declares `TZ=UTC`.
 
-## 2b — Scheduler is about 30 seconds late, so sub-minute periods cannot be demoed
+## 2b — Scheduler's delivery latency, and why `PT1M` is the floor
 
-Measured 09.09.2026 with `FlexibleTimeWindow` set to `OFF`, so no configured jitter. A `PT15S`
-chain:
+Measured 09.09.2026, `FlexibleTimeWindow` set to `OFF`, so none of this is configured jitter.
+
+**The clean measurement**, a `PT1M` chain where nothing was clamped, so each fire is timed against
+the schedule's own `at()`:
+
+| counter | computed triggerAt | actually fired | late by |
+| --- | --- | --- | --- |
+| c0 | 03:59:01 | 03:59:27–03:59:33 | 26–32s |
+| c1 | 04:00:01 | 04:00:12–04:00:20 | 11–19s |
+| c2 | 04:01:01 | 04:01:05–04:01:12 | 4–11s |
+
+So latency is **4–32 seconds and highly variable**, and in this run it shrank on each hop. Do not
+quote a tight figure from this — six fires across two runs is not a distribution, and an earlier
+version of this section recorded "25–37s", which was inferred from clamped timers rather than
+measured and was too narrow.
+
+The chain itself is stable: all four occurrences landed on `:01` seconds exactly 60 apart, so
+`PT1M` neither drifts nor clamps. The next occurrence is still ~25s in the future when a fire
+happens, which is what keeps it that way — and it doubles as the live proof of behaviour 1 at a
+cadence a room can watch.
+
+**Below a minute it falls apart.** The same setup at `PT15S`:
 
 | counter | computed triggerAt | actually fired |
 | --- | --- | --- |
@@ -74,21 +94,15 @@ chain:
 | c1 | 03:43:07 | 03:44:10–03:44:16 |
 | c2 | 03:43:22 | 03:44:54–03:45:00 |
 
-The recurrence arithmetic is exact — 52, 07, 22, fifteen seconds apart. The gap between actual
-*fires* is ~38s then ~44s. Measured from the moment each timer was actually set, Scheduler's own
-delivery latency is 25–37s across three samples.
+The arithmetic is still exact — 52, 07, 22, fifteen seconds apart — but every next occurrence is
+already in the past when it is computed, gets pushed out to `now + min_lead_seconds`, and the gap
+between actual fires becomes ~38s then ~44s. The chain is permanently catching up, which reads on
+screen as a runaway.
 
-So the real cadence is `min_lead_seconds` plus Scheduler's latency. Below a minute, every next
-occurrence is already in the past when it is computed, gets pushed to `now + min_lead_seconds`, and
-the chain runs flat out catching up — which reads as a runaway on screen.
-
-`PT1M` is the smallest period that stays clean: the next occurrence is still ~25s in the future when
-a fire happens, so nothing is clamped and the chain simply runs ~35s behind.
-
-**Three samples is few** — this is recorded as measured, not as a published AWS limit. The design
-conclusion holds either way: this platform cannot deliver sub-minute precision. No current caller
-needs it, but finding that out after a cutover would be too late. Worth reading production's
-`ALTEOS_CRON_TIME` to see whether the old service is tighter or looser.
+The design conclusion holds regardless of the exact numbers: **this platform cannot deliver
+sub-minute precision.** No current caller needs it. But it is an architectural limit nobody has
+written down, and finding it after a cutover would be too late. Worth reading production's
+`ALTEOS_CRON_TIME` to see whether the old service's cron is tighter or looser than this.
 
 ## 3 — The chain ends silently. This is the business case.
 

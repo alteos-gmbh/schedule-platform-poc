@@ -58,9 +58,23 @@ Cùng test đó cho thấy hành vi 3: đúng hai thời điểm ấy nhưng đ�
 
 **Đo được ngoài kịch bản:** một chuỗi để chạy tự do 5,5 tiếng đạt `counter=169`, đi từ `04:03:49.100` tới `09:41:49.100` — giây và milliseconds y hệt sau 169 hop. Zero drift, và là bằng chứng mạnh hơn mọi thứ dựng được trong một buổi demo.
 
-## 2b — Scheduler trễ ~30 giây, nên dưới một phút là không demo được
+## 2b — Độ trễ giao hàng của Scheduler, và vì sao `PT1M` là mức sàn
 
-Đo 09.09.2026, `FlexibleTimeWindow` là `OFF` nên không có jitter do cấu hình. Một chuỗi `PT15S`:
+Đo 09.09.2026, `FlexibleTimeWindow` đặt `OFF`, nên không có phần nào là jitter do cấu hình.
+
+**Phép đo sạch** — chuỗi `PT1M`, không lần nào bị kẹp, nên mỗi fire được tính so với chính `at()` của schedule đó:
+
+| counter | triggerAt tính ra | bắn thật | trễ |
+| --- | --- | --- | --- |
+| c0 | 03:59:01 | 03:59:27–03:59:33 | 26–32s |
+| c1 | 04:00:01 | 04:00:12–04:00:20 | 11–19s |
+| c2 | 04:01:01 | 04:01:05–04:01:12 | 4–11s |
+
+Nên độ trễ là **4–32 giây, biến động mạnh**, và trong lần chạy này nó giảm dần qua từng hop. Đừng trích một con số hẹp từ đây — sáu fire qua hai lần chạy không phải một phân bố, và bản trước của mục này ghi "25–37s", vốn là số **suy ra** từ timer đã bị kẹp chứ không phải đo trực tiếp, và quá hẹp.
+
+Bản thân chuỗi thì ổn định: cả bốn occurrence rơi đúng giây `:01`, cách nhau đúng 60s — `PT1M` không trôi cũng không bị kẹp. Lý do là occurrence kế vẫn còn ~25s trong tương lai lúc fire xảy ra. Nó cũng là bằng chứng sống cho hành vi 1 ở nhịp mà cả phòng theo dõi được.
+
+**Dưới một phút thì đổ.** Cùng setup với `PT15S`:
 
 | counter | triggerAt tính ra | bắn thật |
 | --- | --- | --- |
@@ -68,13 +82,9 @@ Cùng test đó cho thấy hành vi 3: đúng hai thời điểm ấy nhưng đ�
 | c1 | 03:43:07 | 03:44:10–03:44:16 |
 | c2 | 03:43:22 | 03:44:54–03:45:00 |
 
-Phép tính recurrence chính xác từng giây — 52, 07, 22, cách nhau đúng 15s. Nhưng khoảng cách giữa hai lần **bắn** là ~38s rồi ~44s. Đo từ mốc timer thực sự được đặt, độ trễ giao hàng của Scheduler là 25–37s, ba mẫu.
+Phép tính vẫn chính xác — 52, 07, 22, cách nhau đúng 15s — nhưng mọi occurrence kế đã ở quá khứ lúc được tính, bị đẩy lên `now + min_lead_seconds`, và khoảng cách giữa hai lần bắn thật thành ~38s rồi ~44s. Chuỗi vĩnh viễn chạy bắt kịp, nhìn trên màn hình như bùng nổ.
 
-Nên nhịp thật ≈ `min_lead_seconds` + độ trễ Scheduler. Dưới một phút thì mọi occurrence kế đã nằm trong quá khứ lúc được tính, bị kẹp lên `now + min_lead_seconds`, và chuỗi chạy dồn để bắt kịp — nhìn như bùng nổ.
-
-`PT1M` là mức nhỏ nhất còn sạch: occurrence kế nằm ~25s trong tương lai lúc fire xảy ra, nên không bị kẹp, và chuỗi chỉ trễ đều ~35s.
-
-**Ba mẫu là ít** — ghi là "đo được", không phải giới hạn AWS công bố. Nhưng kết luận cho thiết kế thì đứng: platform này không giao được ở độ chính xác dưới phút. Nghiệp vụ thật không quan tâm; nhưng nếu có caller nào cần, phát hiện sau cutover là quá muộn. Cần tra `ALTEOS_CRON_TIME` của production để biết service cũ chặt hơn hay lỏng hơn.
+Kết luận cho thiết kế đứng vững bất kể con số chính xác là bao nhiêu: **platform này không giao được ở độ chính xác dưới phút.** Không caller nào hiện tại cần. Nhưng đó là một giới hạn kiến trúc chưa ai ghi lại, và phát hiện sau cutover thì quá muộn. Cần đọc `ALTEOS_CRON_TIME` của production để biết cron service cũ chặt hơn hay lỏng hơn mức này.
 
 ## 3 — Chuỗi chết im lặng. Đây là business case.
 
