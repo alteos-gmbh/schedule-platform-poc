@@ -370,6 +370,7 @@ resource "aws_lambda_function" "schedule" {
       POC_SCHEDULER_ROLE_ARN     = aws_iam_role.scheduler.arn
       POC_FUNCTION_ARN           = "arn:aws:lambda:${var.region}:${local.account_id}:function:${local.fn_name}"
       POC_PROCESSING_TTL_MINUTES = tostring(var.processing_ttl_minutes)
+      POC_MIN_LEAD_SECONDS       = tostring(var.min_lead_seconds)
       # Declared, not inherited. The endAt gate resolves startOf('day') in the process zone, and
       # the old service pins nothing — so the boundary silently follows whatever TZ the container
       # was started with. See the test in ../src/test.mjs.

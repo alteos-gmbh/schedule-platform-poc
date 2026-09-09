@@ -44,7 +44,7 @@ Cộng hai cron job chạy trong process — `executeScheduledActions` và `rese
 
 ## 1 — Chuỗi định kỳ chạy
 
-Tạo với **period `PT2M`**, bắn sau 70 giây.
+Tạo với **period `PT1M`**, bắn sau 60 giây — cả hai là giá trị mặc định của form, nên chỉ cần một cú bấm.
 
 Nhìn: row đi `pending` → `processing` → `executed`, một row **mới** hiện ra ở `pending` với `counter` đã tăng, và một message rơi vào **Fired** mang theo `authorizationData` có `scopePartnerId` được set và `partnerId` là null — hành vi 5.
 
@@ -58,9 +58,27 @@ Cùng test đó cho thấy hành vi 3: đúng hai thời điểm ấy nhưng đ�
 
 **Đo được ngoài kịch bản:** một chuỗi để chạy tự do 5,5 tiếng đạt `counter=169`, đi từ `04:03:49.100` tới `09:41:49.100` — giây và milliseconds y hệt sau 169 hop. Zero drift, và là bằng chứng mạnh hơn mọi thứ dựng được trong một buổi demo.
 
+## 2b — Scheduler trễ ~30 giây, nên dưới một phút là không demo được
+
+Đo 09.09.2026, `FlexibleTimeWindow` là `OFF` nên không có jitter do cấu hình. Một chuỗi `PT15S`:
+
+| counter | triggerAt tính ra | bắn thật |
+| --- | --- | --- |
+| c0 | 03:42:52 | 03:43:32–03:43:37 |
+| c1 | 03:43:07 | 03:44:10–03:44:16 |
+| c2 | 03:43:22 | 03:44:54–03:45:00 |
+
+Phép tính recurrence chính xác từng giây — 52, 07, 22, cách nhau đúng 15s. Nhưng khoảng cách giữa hai lần **bắn** là ~38s rồi ~44s. Đo từ mốc timer thực sự được đặt, độ trễ giao hàng của Scheduler là 25–37s, ba mẫu.
+
+Nên nhịp thật ≈ `min_lead_seconds` + độ trễ Scheduler. Dưới một phút thì mọi occurrence kế đã nằm trong quá khứ lúc được tính, bị kẹp lên `now + min_lead_seconds`, và chuỗi chạy dồn để bắt kịp — nhìn như bùng nổ.
+
+`PT1M` là mức nhỏ nhất còn sạch: occurrence kế nằm ~25s trong tương lai lúc fire xảy ra, nên không bị kẹp, và chuỗi chỉ trễ đều ~35s.
+
+**Ba mẫu là ít** — ghi là "đo được", không phải giới hạn AWS công bố. Nhưng kết luận cho thiết kế thì đứng: platform này không giao được ở độ chính xác dưới phút. Nghiệp vụ thật không quan tâm; nhưng nếu có caller nào cần, phát hiện sau cutover là quá muộn. Cần tra `ALTEOS_CRON_TIME` của production để biết service cũ chặt hơn hay lỏng hơn.
+
 ## 3 — Chuỗi chết im lặng. Đây là business case.
 
-Bật **legacy ordering** và **break chain write**. Tạo với period `PT2M`.
+Bật **legacy ordering** và **break chain write**. Tạo với period `PT1M`.
 
 Khi nó bắn: row thành **`executed`**, không có row kế tiếp nào được tạo, danh sách timer rỗng đi, và **không có gì xuất hiện trong dead-letter queue**. Dấu vết duy nhất là một dòng log (`chainBrokenSilently`). Policy đó đã ngừng được tính phí và không có cảnh báo nào tồn tại.
 
@@ -68,13 +86,13 @@ Khi nó bắn: row thành **`executed`**, không có row kế tiếp nào đư�
 
 ## 4 — Cùng lỗi đó, với thứ tự đã sửa
 
-Tắt **legacy ordering**, để **break chain write** bật. Tạo với period `PT2M`.
+Tắt **legacy ordering**, để **break chain write** bật. Tạo với period `PT1M`.
 
-Khi nó bắn: transaction fail, nên row đứng ở **`processing`** với `attempts` bò lên và `lastError` được ghi. Lambda retry hai lần — các lần retry cố ý nhận lại đúng row đó, vì nếu từ chối một row `processing` thì attempt thứ hai sẽ *thành công* và lỗi lại biến mất — và sau lần fail thứ ba thì một bản ghi hiện ra trong **Dead letters**, qua destination `aws_lambda_function_event_invoke_config`. Hai phút sau reconciler đưa row về `pending` và tạo lại timer.
+Khi nó bắn: transaction fail, nên row đứng ở **`processing`** với `attempts` bò lên và `lastError` được ghi. Lambda retry hai lần — các lần retry cố ý nhận lại đúng row đó, vì nếu từ chối một row `processing` thì attempt thứ hai sẽ *thành công* và lỗi lại biến mất — và sau lần fail thứ ba thì một bản ghi hiện ra trong **Dead letters**, qua destination `aws_lambda_function_event_invoke_config`. Một phút sau reconciler đưa row về `pending` và tạo lại timer.
 
 Không mất gì, và lỗi nhìn thấy được ở ba nơi thay vì không nơi nào.
 
-Một hệ quả của tham số demo, không phải của thiết kế: `processing_ttl_minutes` ở đây là 2 và reconciler tick mỗi 2 phút, trong khi các lần retry async của Lambda giãn ra vài phút có backoff. Nên reconciler có thể đưa row về `pending` *trong lúc* Lambda vẫn đang retry nó, và cả hai cùng làm một fire. Con số 15 phút trong thiết kế nằm hẳn ngoài cửa sổ retry của Lambda nên không đua. Nên nói ra nếu có ai để ý row nhảy trạng thái.
+Một hệ quả của tham số demo, không phải của thiết kế: `processing_ttl_minutes` và tick của reconciler đều là 1 phút ở đây, trong khi các lần retry async của Lambda giãn ra vài phút có backoff. Nên reconciler thường đưa row về `pending` *trong lúc* Lambda vẫn đang retry, và bản ghi dead-letter tới sau khi row đã trông như bình thường. Con số 15 phút trong thiết kế nằm hẳn ngoài cửa sổ retry của Lambda nên không đua. Nên nói ra, vì thứ tự trên màn hình không phải thứ tự production sinh ra.
 
 Phơi nhiễm mà cách này để lại, và nó thuộc phần thảo luận thiết kế chứ không phải một dòng chú thích: một fire đã publish rồi *mới* fail sẽ publish lại ở mỗi lần retry. Đo ngày 08.09.2026 — đúng kịch bản này đặt **ba** bản sao lên target queue cho một schedule, và bản ghi dead-letter nói thẳng:
 

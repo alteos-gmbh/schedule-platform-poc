@@ -46,7 +46,7 @@ Plus two in-process cron jobs — `executeScheduledActions` and `resetLockedSche
 
 ## 1 — A recurrence chain runs
 
-Create with **period `PT2M`**, fires in 70 seconds.
+Create with **period `PT1M`**, fires in 60 seconds — both are the form defaults, so this is one click.
 
 Watch: the row goes `pending` → `processing` → `executed`, a **new** row appears `pending` with
 `counter` incremented, and a message lands in **Fired** carrying `authorizationData` with
@@ -63,9 +63,36 @@ on `03-31` rather than `03-28`. Behaviour 1.
 The same test shows behaviour 3: the same two instants read in UTC+7 give a different answer, so
 the old service's chain length depends on the container's `TZ`. The PoC's Lambda declares `TZ=UTC`.
 
+## 2b — Scheduler is about 30 seconds late, so sub-minute periods cannot be demoed
+
+Measured 09.09.2026 with `FlexibleTimeWindow` set to `OFF`, so no configured jitter. A `PT15S`
+chain:
+
+| counter | computed triggerAt | actually fired |
+| --- | --- | --- |
+| c0 | 03:42:52 | 03:43:32–03:43:37 |
+| c1 | 03:43:07 | 03:44:10–03:44:16 |
+| c2 | 03:43:22 | 03:44:54–03:45:00 |
+
+The recurrence arithmetic is exact — 52, 07, 22, fifteen seconds apart. The gap between actual
+*fires* is ~38s then ~44s. Measured from the moment each timer was actually set, Scheduler's own
+delivery latency is 25–37s across three samples.
+
+So the real cadence is `min_lead_seconds` plus Scheduler's latency. Below a minute, every next
+occurrence is already in the past when it is computed, gets pushed to `now + min_lead_seconds`, and
+the chain runs flat out catching up — which reads as a runaway on screen.
+
+`PT1M` is the smallest period that stays clean: the next occurrence is still ~25s in the future when
+a fire happens, so nothing is clamped and the chain simply runs ~35s behind.
+
+**Three samples is few** — this is recorded as measured, not as a published AWS limit. The design
+conclusion holds either way: this platform cannot deliver sub-minute precision. No current caller
+needs it, but finding that out after a cutover would be too late. Worth reading production's
+`ALTEOS_CRON_TIME` to see whether the old service is tighter or looser.
+
 ## 3 — The chain ends silently. This is the business case.
 
-Turn on **legacy ordering** and **break chain write**. Create with period `PT2M`.
+Turn on **legacy ordering** and **break chain write**. Create with period `PT1M`.
 
 When it fires: the row goes **`executed`**, no next row is created, the timers list empties, and
 **nothing appears in the dead-letter queue**. The only trace is one log line
@@ -76,22 +103,23 @@ occurrence, and `:236` catches whatever throws between them and logs it.
 
 ## 4 — The same failure, with the ordering fixed
 
-Turn **legacy ordering off**, leave **break chain write** on. Create with period `PT2M`.
+Turn **legacy ordering off**, leave **break chain write** on. Create with period `PT1M`.
 
 When it fires: the transaction fails, so the row stays **`processing`** with `attempts` climbing
 and `lastError` filled in. Lambda retries twice — the retries re-enter the same row deliberately,
 because refusing a `processing` row would make attempt two *succeed* and the failure would vanish
 again — and after the third failure a record appears in **Dead letters**, through the
-`aws_lambda_function_event_invoke_config` destination. After two minutes the reconciler moves the
+`aws_lambda_function_event_invoke_config` destination. After a minute the reconciler moves the
 row back to `pending` and re-creates its timer.
 
 Nothing was lost, and the failure is visible in three places instead of none.
 
-One artefact of the demo settings, not of the design: `processing_ttl_minutes` is 2 here and the
-reconciler ticks every 2 minutes, while Lambda's own async retries are spread over several minutes
-with backoff. So the reconciler can take the row back to `pending` *while* Lambda is still retrying
-it, and both then work the same fire. The design's 15-minute tick sits well outside Lambda's retry
-window and does not race. Worth saying out loud if someone notices the row flipping.
+One artefact of the demo settings, not of the design: `processing_ttl_minutes` and the reconciler
+tick are both 1 minute here, while Lambda's own async retries are spread over several minutes with
+backoff. So the reconciler usually takes the row back to `pending` *while* Lambda is still retrying
+it, and the dead-letter record lands after the row already looks healthy. The design's 15-minute
+tick sits well outside Lambda's retry window and does not race. Worth saying out loud, because the
+order on screen is not the order production would produce.
 
 The exposure this leaves, which belongs in the design discussion rather than in a footnote: a fire
 that published and *then* failed publishes again on every retry. Measured 08.09.2026 — this exact

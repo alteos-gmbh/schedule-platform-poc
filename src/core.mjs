@@ -92,6 +92,15 @@ export const env = Object.freeze({
   schedulerRoleArn: required('POC_SCHEDULER_ROLE_ARN'),
   functionArn: required('POC_FUNCTION_ARN'),
   processingTtlMinutes: Number(process.env.POC_PROCESSING_TTL_MINUTES ?? '5'),
+  /**
+   * How far ahead a timer must be. Only a `triggerAt` closer than this gets pushed out, and the
+   * only reason the floor exists at all is repair: the reconciler re-creates timers for occurrences
+   * whose own time has already passed, and `at()` in the past is not a shape Scheduler documents.
+   *
+   * Small by default so a sub-minute `period` — `PT15S`, say — behaves as written. Raise it if a
+   * demo needs the clamp to be visible.
+   */
+  minLeadSeconds: Number(process.env.POC_MIN_LEAD_SECONDS ?? '10'),
 });
 
 function required(name) {
@@ -349,12 +358,11 @@ export const scheduleNameFor = (id) => `poc-schedule-${id}`;
 export async function createSchedule(row) {
   const name = scheduleNameFor(row.id);
 
-  // A repair re-creates the timer for an occurrence whose own `triggerAt` has already passed, and
-  // `at()` in the past is not a shape Scheduler is documented to accept. The floor keeps the repair
-  // honest and observable: the fire happens a minute from now rather than silently never. How
-  // Scheduler actually answers a past `at()` is one of the things this PoC measures — see DEMO.md.
+  // The floor applies only when `triggerAt` is nearer than the minimum lead — normally because the
+  // occurrence is a repair whose time has already passed. A schedule that is far enough out keeps
+  // its own time exactly, so `period` is honoured as written all the way down to seconds.
   const wanted = DateTime.fromISO(String(row.triggerAt)).toUTC();
-  const floor = DateTime.utc().plus({ seconds: 60 });
+  const floor = DateTime.utc().plus({ seconds: env.minLeadSeconds });
 
   // Second precision, formatted explicitly. Scheduler rejects an `at()` carrying fractional
   // seconds — `Invalid Schedule Expression at(2026-09-08T03:54:26.439)` — and luxon's

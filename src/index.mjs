@@ -7,6 +7,7 @@
  */
 
 import {
+  CONFIG_ID,
   createSchedule,
   deleteRow,
   deleteSchedule,
@@ -308,7 +309,11 @@ const ROUTES = {
       await deleteSchedule(row.id);
       await deleteRow(row.id);
     }
-    for (const id of [FEED_FIRED, FEED_DLQ]) await deleteRow(id);
+    // CONFIG_ID goes too. `scanRows` filters out every `__`-prefixed id, so a reset that only
+    // walked those rows left the demo switches set — and a `break publish` left on from an earlier
+    // scenario then silently poisons the next one, which is a genuinely hard failure to read.
+    // A button called "reset everything" resets everything.
+    for (const id of [FEED_FIRED, FEED_DLQ, CONFIG_ID]) await deleteRow(id);
 
     // Drain the queues too. Deleting the feed rows without emptying the queues leaves messages
     // from before the reset to reappear on the next poll, which during a demo looks exactly like

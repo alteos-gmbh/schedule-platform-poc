@@ -66,15 +66,41 @@ variable "scheduler_trust_form" {
 }
 
 variable "reconciler_rate_minutes" {
-  description = "Reconciler tick. 2 minutes so a demo does not stall; the design says 15."
+  description = <<-DESC
+    Reconciler tick. 1 minute, which is the smallest interval `rate()` accepts, so nobody waits on
+    it during a demo. The design says 15.
+  DESC
   type        = number
-  default     = 2
+  default     = 1
 }
 
 variable "processing_ttl_minutes" {
-  description = "How long a row may sit in `processing` before the reconciler takes it back."
+  description = <<-DESC
+    How long a row may sit in `processing` before the reconciler takes it back. 1 minute here for
+    the same reason as the tick.
+
+    Note what this costs: Lambda's own async retries are spread over several minutes with backoff,
+    so at 1 minute the reconciler will usually return the row to `pending` *before* Lambda has
+    finished retrying, and the dead-letter record then arrives after the row already looks healthy.
+    Both still happen and the scenario still holds — the order on screen is just not the order the
+    design produces at 15 minutes.
+  DESC
   type        = number
-  default     = 2
+  default     = 1
+}
+
+variable "min_lead_seconds" {
+  description = <<-DESC
+    How far ahead of now a timer must be before Scheduler is asked for it. A `triggerAt` nearer than
+    this is pushed out to it; anything further away is used exactly as given.
+
+    The floor exists for repair — the reconciler re-creates timers for occurrences whose time has
+    already passed, and `at()` in the past is not a documented shape. 10 seconds is enough to cover
+    the CreateSchedule round trip while leaving a sub-minute `period` such as `PT15S` working as
+    written, which a demo needs and a minute-long floor quietly prevented.
+  DESC
+  type        = number
+  default     = 10
 }
 
 variable "log_retention_days" {
