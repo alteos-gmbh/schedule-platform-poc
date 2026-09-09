@@ -139,26 +139,45 @@ export async function dispatch(scheduleId, log) {
      * which means the status flips in the same moment the dead-letter record appears rather than a
      * reconciler tick later. Every earlier attempt leaves it `processing` to be retried.
      */
+    /**
+     * Two budgets have to agree before a row is terminal, and getting that wrong is easy: the
+     * attempt budget belongs to this firing, the delivery budget belongs to the occurrence.
+     *
+     * Exhausting the attempts only ends *this* firing. The row is parked at `failed` here just
+     * when the occurrence has no firing left either; otherwise it stays `processing` and the
+     * reconciler re-fires it after the TTL. Re-firing lives in the reconciler alone — a second
+     * place deciding to fire is a second place that can decide wrong.
+     */
     const attempts = (claimed.attempts ?? 0) + 1;
-    const exhausted = attempts >= env.invocationsPerFiring;
+    const deliveries = claimed.deliveries ?? 1;
+    const maxDeliveries = config.maxDeliveryAttempts ?? env.maxDeliveryAttempts;
+
+    const firingSpent = attempts >= env.invocationsPerFiring;
+    const terminal = firingSpent && deliveries >= maxDeliveries;
 
     await transition(
       row.id,
       STATUS.Processing,
-      exhausted ? STATUS.Failed : STATUS.Processing,
+      terminal ? STATUS.Failed : STATUS.Processing,
       {
         attempts,
         lastError: String(error.message).slice(0, 500),
-        ...(exhausted ? { failedAt: new Date().toISOString() } : {}),
+        ...(terminal ? { failedAt: new Date().toISOString() } : {}),
       }
     );
 
-    log('dispatch', exhausted ? 'fireGaveUp' : 'fireFailed', {
-      scheduleId,
-      attempt: attempts,
-      of: env.invocationsPerFiring,
-      reason: error.message,
-    });
+    log(
+      'dispatch',
+      terminal ? 'fireGaveUp' : firingSpent ? 'firingSpent' : 'fireFailed',
+      {
+        scheduleId,
+        attempt: attempts,
+        of: env.invocationsPerFiring,
+        delivery: deliveries,
+        ofDeliveries: maxDeliveries,
+        reason: error.message,
+      }
+    );
 
     throw error;
   }
@@ -310,6 +329,7 @@ export async function reconcile(log) {
 
     const back = await transition(row.id, STATUS.Processing, STATUS.Pending, {
       deliveries: used + 1,
+      attempts: 0,
     });
     if (!back) continue;
     await createSchedule(back);

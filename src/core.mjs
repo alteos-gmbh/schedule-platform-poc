@@ -815,8 +815,12 @@ export async function forceStatus(id, to) {
  *
  * CloudWatch ingestion lags by seconds, so the panel is always slightly behind the table. That is
  * the display being late, not the platform.
+ *
+ * An hour of history rather than fifteen minutes: once the filtering moved server-side only handler
+ * lines match, so the window costs almost nothing — and a fifteen-minute window meant that coming
+ * back to ask "what happened to that row" half an hour later had no answer left.
  */
-export async function readLogs({ minutes = 15, limit = 60 } = {}) {
+export async function readLogs({ minutes = 60, limit = 80 } = {}) {
   if (!env.logGroup) return [];
 
   try {
