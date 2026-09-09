@@ -29,6 +29,20 @@ import {
 const here = dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT ?? 8787);
 
+/**
+ * Shared token, required only when set.
+ *
+ * On a laptop the console is reachable only from that laptop, so nothing needs guarding and the
+ * default is no gate. Behind a tunnel it is a different situation entirely: the URL is public while
+ * the tunnel is open, this process holds AWS credentials, and the demo surface can create, cancel
+ * and reset schedules. So a tunnelled console sets POC_CONSOLE_TOKEN, and the link handed round
+ * carries `?t=<token>` once — after that a cookie carries it, so a refresh keeps working.
+ *
+ * This is not authentication. It stops a URL from being enough on its own, which for a demo window
+ * is the whole requirement.
+ */
+const TOKEN = process.env.POC_CONSOLE_TOKEN ?? '';
+
 const outputs = readTerraformOutputs();
 const lambda = new LambdaClient({ region: outputs.region });
 
@@ -42,14 +56,16 @@ console.log(
 
 createServer(async (request, response) => {
   try {
-    if (request.url === '/' || request.url === '/index.html') {
+    if (!authorised(request, response)) return;
+
+    if (request.url.split('?')[0] === '/' || request.url.startsWith('/index.html')) {
       const page = await readFile(join(here, 'ui', 'index.html'));
       response.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
       response.end(page);
       return;
     }
 
-    if (request.url === '/config') {
+    if (request.url.split('?')[0] === '/config') {
       return send(response, 200, {
         account: outputs.account_id,
         region: outputs.region,
@@ -69,10 +85,45 @@ createServer(async (request, response) => {
   }
 }).listen(PORT);
 
+/**
+ * The token gate. Accepts the token from `?t=`, from a cookie, or from an `x-poc-token` header,
+ * and sets the cookie so the query string is needed only for the first request.
+ */
+function authorised(request, response) {
+  if (!TOKEN) return true;
+
+  const url = new URL(request.url, 'http://localhost');
+  const fromQuery = url.searchParams.get('t');
+  const fromHeader = request.headers['x-poc-token'];
+  const fromCookie = String(request.headers.cookie ?? '')
+    .split(';')
+    .map((part) => part.trim())
+    .find((part) => part.startsWith('poc_token='))
+    ?.slice('poc_token='.length);
+
+  if (fromQuery === TOKEN) {
+    // HttpOnly so page scripts cannot read it back out; SameSite=Lax is enough for a link people
+    // open directly. No Secure flag decision to make — a tunnel is always https.
+    response.setHeader(
+      'set-cookie',
+      `poc_token=${TOKEN}; HttpOnly; SameSite=Lax; Secure; Path=/; Max-Age=28800`
+    );
+    return true;
+  }
+
+  if (fromHeader === TOKEN || fromCookie === TOKEN) return true;
+
+  response.writeHead(404, { 'content-type': 'text/plain' });
+  response.end('not found\n');
+  return false;
+}
+
 /** One browser request becomes one `lambda:Invoke` with an HTTP-shaped payload. */
 async function forward(request, response) {
   const url = new URL(request.url, 'http://localhost');
   const path = url.pathname.replace(/^\/api/, '');
+  // The gate's own parameter is not part of the management call.
+  url.searchParams.delete('t');
   const body = await readBody(request);
 
   const event = {

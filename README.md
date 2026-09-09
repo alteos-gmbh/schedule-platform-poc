@@ -58,6 +58,43 @@ Tear it down when the demo is over. Nothing is protected against deletion, delib
 cd infra && terraform destroy -var expected_account_id=<your account>
 ```
 
+### Letting other people watch it
+
+The page is static, but the proxy is the part that holds AWS credentials and makes the
+`lambda:Invoke` calls — so there is nothing useful to "just host". Two ways round that.
+
+**Screen share** needs no setup and is what the console was built for: four panels refreshing every
+two seconds, and a scenario that lands in thirty seconds (create, drop timer, reconcile now).
+
+**A tunnel** lets people click it themselves:
+
+```sh
+brew install cloudflared
+
+# a token, so the URL alone is not enough
+export POC_CONSOLE_TOKEN=$(node -e "console.log(require('crypto').randomBytes(16).toString('base64url'))")
+npm run console &
+cloudflared tunnel --url http://localhost:8787
+```
+
+The tunnel prints a `https://<random>.trycloudflare.com` URL. Hand round
+`https://<random>.trycloudflare.com/?t=$POC_CONSOLE_TOKEN` — the token is needed once, then a
+cookie carries it, so refreshes keep working.
+
+`POC_CONSOLE_TOKEN` is only checked when it is set, so a laptop-only console stays as it was. It is
+not authentication and is not pretending to be: it stops the URL from being sufficient on its own,
+which is the entire requirement for a demo window. Anyone holding the link can create, cancel and
+reset schedules in the account, because the demo surface is meant to let them — so treat the link
+like a credential, and stop the tunnel when the demo is over.
+
+The URL changes every time the tunnel restarts, the laptop has to stay awake, and closing the
+terminal ends it. That is the trade for touching no infrastructure.
+
+**Not a Lambda Function URL.** `AUTH_IAM` requires SigV4-signed requests, which a browser cannot
+produce, so the safe setting is useless for this; and `AUTH_NONE` is a permanent public endpoint
+with write access to the stack. It would also undercut the demo's own message, since the settled
+design gives the real function no URL at all.
+
 ### Working from a second machine
 
 The Terraform state is local and not in this repo — it names live resources and belongs to whoever
