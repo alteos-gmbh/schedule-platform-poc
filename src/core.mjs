@@ -114,7 +114,6 @@ export const env = Object.freeze({
    * Small by default so a sub-minute `period` — `PT15S`, say — behaves as written. Raise it if a
    * demo needs the clamp to be visible.
    */
-  minLeadSeconds: Number(process.env.POC_MIN_LEAD_SECONDS ?? '10'),
   logGroup: process.env.POC_LOG_GROUP ?? '',
   /**
    * How many times the platform will try to deliver one occurrence before giving up on it.
@@ -403,15 +402,13 @@ export const scheduleNameFor = (id) => `poc-schedule-${id}`;
  * 07.09.2026 — see docs/consistency.md. A `ClientToken` changes nothing here and is not sent.
  */
 export async function createSchedule(row) {
-  const { input, firesAt } = scheduleDefinition(row);
+  const input = scheduleDefinition(row);
 
   try {
     await scheduler.send(new CreateScheduleCommand(input));
-    return { created: true, name: input.Name, firesAt };
+    return { created: true, name: input.Name };
   } catch (error) {
-    if (error.name === 'ConflictException') {
-      return { created: false, name: input.Name, firesAt };
-    }
+    if (error.name === 'ConflictException') return { created: false, name: input.Name };
     throw error;
   }
 }
@@ -428,50 +425,47 @@ export async function createSchedule(row) {
  * because there was nothing to update would be a strange way to learn that.
  */
 export async function updateSchedule(row) {
-  const { input, firesAt } = scheduleDefinition(row);
+  const input = scheduleDefinition(row);
 
   try {
     await scheduler.send(new UpdateScheduleCommand(input));
-    return { updated: true, name: input.Name, firesAt };
+    return { updated: true, name: input.Name };
   } catch (error) {
     if (error.name !== 'ResourceNotFoundException') throw error;
-    const created = await createSchedule(row);
-    return { updated: false, ...created };
+    return { updated: false, ...(await createSchedule(row)) };
   }
 }
 
 /**
- * The full one-shot definition for a row, and the one place the lead time is applied.
+ * The full one-shot definition for a row.
  *
- * `firesAt` is returned alongside because it is not always `triggerAt`: a time already in the past
- * — a repair, or a retime aimed backwards — cannot be given to `at()`, so it is pushed to the
- * earliest moment Scheduler will accept. The row keeps the requested time because the row records
- * intent; the caller is told when the fire will actually happen.
+ * The row's own `triggerAt` is used verbatim, including a time that has already gone.
+ *
+ * An earlier version pushed a past time forward to `now + a lead`, on the assumption that
+ * `at()` in the past was not a shape Scheduler accepts. Measured 10.09.2026 and the assumption was
+ * wrong: `at()` an hour in the past is accepted, and a schedule two minutes in the past invoked the
+ * function about 45 seconds after being created — the same latency as any other fire. So the lead
+ * was doing nothing except delaying a repair by ten seconds and rewriting what the caller asked
+ * for. A retime aimed backwards now fires as soon as Scheduler gets to it, which is what anyone
+ * moving a trigger into the past means by it.
  */
 function scheduleDefinition(row) {
-  const wanted = DateTime.fromISO(String(row.triggerAt)).toUTC();
-  const floor = DateTime.utc().plus({ seconds: env.minLeadSeconds });
-  const when = wanted > floor ? wanted : floor;
+  const when = DateTime.fromISO(String(row.triggerAt)).toUTC();
 
   // Second precision, formatted explicitly. Scheduler rejects an `at()` carrying fractional
   // seconds — `Invalid Schedule Expression at(2026-09-08T03:54:26.439)` — and luxon's
   // `suppressMilliseconds` only drops them when they happen to be zero, so it is not a fix.
-  // Kept apart from the command input: an extra key on an SDK command shape is silently dropped
-  // today and is not something to rely on tomorrow.
   return {
-    firesAt: when.toISO(),
-    input: {
-      Name: scheduleNameFor(row.id),
-      GroupName: env.group,
-      ScheduleExpression: `at(${when.toFormat("yyyy-MM-dd'T'HH:mm:ss")})`,
-      ScheduleExpressionTimezone: 'UTC',
-      FlexibleTimeWindow: { Mode: 'OFF' },
-      ActionAfterCompletion: 'DELETE',
-      Target: {
-        Arn: env.functionArn,
-        RoleArn: env.schedulerRoleArn,
-        Input: JSON.stringify({ scheduleId: row.id }),
-      },
+    Name: scheduleNameFor(row.id),
+    GroupName: env.group,
+    ScheduleExpression: `at(${when.toFormat("yyyy-MM-dd'T'HH:mm:ss")})`,
+    ScheduleExpressionTimezone: 'UTC',
+    FlexibleTimeWindow: { Mode: 'OFF' },
+    ActionAfterCompletion: 'DELETE',
+    Target: {
+      Arn: env.functionArn,
+      RoleArn: env.schedulerRoleArn,
+      Input: JSON.stringify({ scheduleId: row.id }),
     },
   };
 }

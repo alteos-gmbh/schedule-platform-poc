@@ -436,7 +436,9 @@
                 $('createResult').textContent =
                   status === 200
                     ? `${short(row.id)} retimed to ${data.triggerAt}` +
-                      (data.clamped ? ` — already past, fires ${data.firesAt}` : '')
+                      (Date.parse(data.triggerAt) <= Date.now()
+                        ? ' — already past, so it fires straight away'
+                        : '')
                     : `${status}: ${data.error ?? JSON.stringify(data)}`;
               }),
               // The two below break the platform on purpose: one takes the timer away from a live

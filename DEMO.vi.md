@@ -86,7 +86,9 @@ Bản thân chuỗi thì ổn định: cả bốn occurrence rơi đúng giây `
 | c1 | 03:43:07 | 03:44:10–03:44:16 |
 | c2 | 03:43:22 | 03:44:54–03:45:00 |
 
-Phép tính vẫn chính xác — 52, 07, 22, cách nhau đúng 15s — nhưng mọi occurrence kế đã ở quá khứ lúc được tính, bị đẩy lên `now + min_lead_seconds`, và khoảng cách giữa hai lần bắn thật thành ~38s rồi ~44s. Chuỗi vĩnh viễn chạy bắt kịp, nhìn trên màn hình như bùng nổ.
+Phép tính vẫn chính xác — 52, 07, 22, cách nhau đúng 15s — nhưng mọi occurrence kế đã ở quá khứ lúc được tính, nên nó bắn ngay khi Scheduler tới, và chuỗi vĩnh viễn chạy bắt kịp. Nhìn trên màn hình như bùng nổ.
+
+Một lưu ý về các số `PT15S` ở trên: chúng được đo khi code còn đẩy `at()` quá khứ lên thêm 10 giây, theo một giả định sai đã bỏ (xem mục 5b). Không có cái sàn đó thì chuỗi dưới một phút bắt kịp còn nhanh hơn bảng này. Kết luận không đổi — cái sàn chưa bao giờ là nguyên nhân khiến dưới-một-phút không giao được, độ trễ của Scheduler mới là.
 
 Kết luận cho thiết kế đứng vững bất kể con số chính xác là bao nhiêu: **platform này không giao được ở độ chính xác dưới phút.** Không caller nào hiện tại cần. Nhưng đó là một giới hạn kiến trúc chưa ai ghi lại, và phát hiện sau cutover thì quá muộn. Cần đọc `ALTEOS_CRON_TIME` của production để biết cron service cũ chặt hơn hay lỏng hơn mức này.
 

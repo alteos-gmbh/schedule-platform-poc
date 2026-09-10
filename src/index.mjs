@@ -201,28 +201,21 @@ const ROUTES = {
     if (!updated) return json(409, { error: 'status changed while retiming' });
 
     // A parked row has no timer and must not get one — that is what `activate` is for.
-    const timer =
-      updated.status === STATUS.Pending
-        ? await updateSchedule(updated)
-        : { firesAt: null };
+    if (updated.status === STATUS.Pending) await updateSchedule(updated);
 
-    const clamped = timer.firesAt !== null && timer.firesAt !== triggerAt;
-
-    log('api', clamped ? 'retimedIntoThePast' : 'retimed', {
+    // A target in the past is not a special case: Scheduler accepts it and fires as soon as it
+    // gets there, so the row is simply retimed and the caller has nothing extra to interpret.
+    log('api', 'retimed', {
       scheduleId: row.id,
       from: row.triggerAt,
       to: triggerAt,
-      firesAt: timer.firesAt,
+      inThePast: Date.parse(triggerAt) <= Date.now(),
     });
 
     return json(200, {
       scheduleId: row.id,
       status: updated.status,
       triggerAt,
-      firesAt: timer.firesAt,
-      // Said plainly rather than left for the caller to compare: a time already gone cannot be
-      // given to `at()`, so the fire happens at the earliest moment Scheduler accepts instead.
-      clamped,
     });
   },
 
@@ -399,7 +392,6 @@ const ROUTES = {
         maxDeliveryAttempts: config.maxDeliveryAttempts ?? env.maxDeliveryAttempts,
         invocationsPerFiring: env.invocationsPerFiring,
         processingTtlMinutes: env.processingTtlMinutes,
-        minLeadSeconds: env.minLeadSeconds,
       },
       rows: rows.sort((a, b) => String(a.triggerAt).localeCompare(b.triggerAt)),
       schedules,

@@ -102,28 +102,14 @@ variable "processing_ttl_minutes" {
   }
 }
 
-variable "min_lead_seconds" {
-  description = <<-DESC
-    How far ahead of now a timer must be before Scheduler is asked for it. A `triggerAt` nearer than
-    this is pushed out to it; anything further away is used exactly as given.
-
-    The floor exists for repair — the reconciler re-creates timers for occurrences whose time has
-    already passed, and `at()` in the past is not a documented shape. 10 seconds is enough to cover
-    the CreateSchedule round trip while leaving a sub-minute `period` such as `PT15S` working as
-    written, which a demo needs and a minute-long floor quietly prevented.
-  DESC
-  type        = number
-  default     = 10
-}
-
 variable "lambda_retry_attempts" {
   description = <<-DESC
     Lambda's own async retries after the first invocation, so total invocations per firing is this
     plus one. At 1 a firing is two attempts — attempt one fails, attempt two fails, and the failure
     destination writes one dead-letter record.
 
-    At 2 — the default, and what the dead-letter record reports as
-    `approximateInvokeCount: 3` — a firing is three attempts before `RetriesExhausted`.
+    At 2 — the default, and what the dead-letter record reports as `approximateInvokeCount: 3` — a
+    firing is three attempts before `RetriesExhausted`.
 
     This is the number a viewer counts on screen as `attempts` climbing on the row, because the
     dispatcher records one failure per invocation.

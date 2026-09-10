@@ -378,7 +378,6 @@ resource "aws_lambda_function" "schedule" {
       POC_SCHEDULER_ROLE_ARN     = aws_iam_role.scheduler.arn
       POC_FUNCTION_ARN           = "arn:aws:lambda:${var.region}:${local.account_id}:function:${local.fn_name}"
       POC_PROCESSING_TTL_MINUTES = tostring(var.processing_ttl_minutes)
-      POC_MIN_LEAD_SECONDS       = tostring(var.min_lead_seconds)
       POC_MAX_DELIVERY_ATTEMPTS  = tostring(var.max_delivery_attempts)
       # Lambda never tells a function which retry it is on, so the function counts for itself and
       # needs to know where the count ends.

@@ -78,8 +78,8 @@ the old service's chain length depends on the container's `TZ`. The PoC's Lambda
 
 Measured 09.09.2026, `FlexibleTimeWindow` set to `OFF`, so none of this is configured jitter.
 
-**The clean measurement**, a `PT1M` chain where nothing was clamped, so each fire is timed against
-the schedule's own `at()`:
+**The clean measurement**, a `PT1M` chain whose timers all kept their own time, so each fire is
+timed against the schedule's own `at()`:
 
 | counter | computed triggerAt | actually fired | late by |
 | --- | --- | --- | --- |
@@ -106,9 +106,13 @@ cadence a room can watch.
 | c2 | 03:43:22 | 03:44:54–03:45:00 |
 
 The arithmetic is still exact — 52, 07, 22, fifteen seconds apart — but every next occurrence is
-already in the past when it is computed, gets pushed out to `now + min_lead_seconds`, and the gap
-between actual fires becomes ~38s then ~44s. The chain is permanently catching up, which reads on
-screen as a runaway.
+already in the past by the time it is computed, so the gap between actual fires became ~38s then
+~44s. The chain is permanently catching up, which reads on screen as a runaway.
+
+These two numbers were taken while a past `at()` was being pushed forward by ten seconds, on an
+assumption since measured wrong and removed — see 5b. Without that floor the catch-up is faster
+than shown. What it does not change is the conclusion: the floor was never what made sub-minute
+undeliverable, Scheduler's own latency is.
 
 The design conclusion holds regardless of the exact numbers: **this platform cannot deliver
 sub-minute precision.** No current caller needs it. But it is an architectural limit nobody has
@@ -183,19 +187,30 @@ That workaround is visible in the code being replaced: `resyncTerminationSchedul
 termination actions "must be cancelled and recreated to fire at the new time", because a smart
 policy update can move the policy end date and there was no other way to follow it.
 
-Set **fire after (minutes)** and press **retime** on a pending row. Measured 10.09.2026:
+Set **fire after (minutes)** — negative is allowed — and press **retime** on a pending row.
 
-| Target | `triggerAt` recorded | `firesAt` | `clamped` |
-| --- | --- | --- | --- |
-| +5 minutes | 04:45:36.637 | 04:45:36.637 | false |
-| −10 minutes | 04:30:36.984 | 04:40:47.282 | **true** |
+The reference point is *now, at the moment of the update*, never the time the schedule used to have.
+Moving a trigger earlier is not a special case. Measured 10.09.2026, a row created at 12:00 to fire
+at 12:30 and retimed at 12:05:
 
-Two things to say while it is on screen.
+| Retimed to | Accepted | Fires |
+| --- | --- | --- |
+| 12:15 — earlier, still future | yes, verbatim | 12:15 |
+| 12:45 — later | yes, verbatim | 12:45 |
+| 12:05 — already gone | yes, verbatim | within about 40 seconds |
 
-**A past target is accepted, not rejected.** The row records what was asked for, because the row
-records intent; the timer cannot be given an `at()` that has gone, so it fires at the earliest
-moment Scheduler accepts and the response says so. The row retimed backwards above fired at
-04:41:28 and went `executed`.
+**A past target is not rejected, and does not need to be.** `at()` an hour in the past is accepted
+by Scheduler, and a schedule two minutes in the past invoked the function about 45 seconds after
+being created — the same latency as any other fire. That was measured on 10.09.2026 because an
+earlier version of this PoC assumed the opposite and pushed a past time forward to `now + 10s`. The
+assumption was wrong, the lead time it needed is gone, and a backwards retime now does what anyone
+asking for one means: fires straight away.
+
+**Retiming twice leaves one timer, not two.** The timer's name is derived from the row id, so
+`UpdateSchedule` replaces the same object however many times a caller changes their mind — verified
+by counting the group after two retimes. The cancel-and-recreate workaround the old service forces
+cannot offer that: it is two writes to two systems with a window in between where the cancel landed
+and the create has not.
 
 **The recurrence anchor moves with it.** A recurring row computes the next occurrence as
 `beginAt + period × (counter + 1)`, so moving `triggerAt` alone would leave the chain anchored to
