@@ -166,6 +166,47 @@ nobody has checked that they are. Worth a ticket.
 Turn on **break publish** only. Same shape as 4, with the error coming from the queue write. Shows
 that both failure paths land in the same place.
 
+## 5b — Retime, which the old service cannot do at all
+
+The lead's question was whether a business rule forbids changing a schedule's trigger time. It does
+not. There is simply no update endpoint, and the design already decided to add one — from
+[the README](../../services-monorepo/serverless/schedule/README.md):
+
+| Endpoint | Does |
+| --- | --- |
+| `PATCH /v1/schedules/:id` | Retime or repayload — **the old service had no update at all** |
+
+> Two of these are new. Without `PATCH`, `workflow` implements an update as a cancel followed by a
+> create, which is two schedules' worth of failure modes for one intention.
+
+That workaround is visible in the code being replaced: `resyncTerminationScheduledActions.ts` says
+termination actions "must be cancelled and recreated to fire at the new time", because a smart
+policy update can move the policy end date and there was no other way to follow it.
+
+Set **fire after (minutes)** and press **retime** on a pending row. Measured 10.09.2026:
+
+| Target | `triggerAt` recorded | `firesAt` | `clamped` |
+| --- | --- | --- | --- |
+| +5 minutes | 04:45:36.637 | 04:45:36.637 | false |
+| −10 minutes | 04:30:36.984 | 04:40:47.282 | **true** |
+
+Two things to say while it is on screen.
+
+**A past target is accepted, not rejected.** The row records what was asked for, because the row
+records intent; the timer cannot be given an `at()` that has gone, so it fires at the earliest
+moment Scheduler accepts and the response says so. The row retimed backwards above fired at
+04:41:28 and went `executed`.
+
+**The recurrence anchor moves with it.** A recurring row computes the next occurrence as
+`beginAt + period × (counter + 1)`, so moving `triggerAt` alone would leave the chain anchored to
+the time the schedule used to have — the retime would look correct and then undo itself one fire
+later. `processingData` is re-anchored and the counter reset; there is a test for exactly that,
+because it is the failure that would not be noticed in a demo.
+
+`executed`, `cancelled` and `failed` rows answer `409`. Retiming a terminal row would be inventing
+a resurrection path nobody designed, and `activate` already covers the one case where bringing a row
+back is intended.
+
 ## 6 — Cancel
 
 Create one, then press **cancel policy** — `DELETE /v2/schedule?policyId=`. The row goes

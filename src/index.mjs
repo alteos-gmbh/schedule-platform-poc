@@ -26,8 +26,10 @@ import {
   queueDepth,
   readLogs,
   scanRows,
+  retimePatch,
   setConfig,
   splitStatuses,
+  updateSchedule,
   STATUS,
   transition,
   validateActivate,
@@ -37,6 +39,7 @@ import {
   validateCreateV1,
   validateCreateV2,
   validateGet,
+  validateIsoDate,
 } from './core.mjs';
 import { dispatch, reconcile } from './dispatch.mjs';
 
@@ -152,6 +155,74 @@ const ROUTES = {
 
     return json(201, {
       created: [{ id: row.id, status: row.status, triggerAt: row.triggerAt }],
+    });
+  },
+
+  /**
+   * Retime one schedule.
+   *
+   * The design has this as `PATCH /v1/schedules/:id` — "retime or repayload"; the id is in the body
+   * here only because this router matches whole paths and a demo does not need path parameters.
+   *
+   * The service being replaced has no update at all, which is why `workflow` moves a termination
+   * date by cancelling and creating — "two schedules' worth of failure modes for one intention",
+   * as the design puts it. Nothing forbade an update; there was simply never one to call.
+   */
+  'POST /schedule/update': async ({ body, log }) => {
+    if (!validateIsoDate(body?.triggerAt)) {
+      return badRequest(['triggerAt must be an ISO date']);
+    }
+
+    const row = await getRow(body?.scheduleId);
+    if (!row) return json(404, { error: 'no such schedule' });
+
+    /**
+     * Only a row that has not fired yet. `executed` is history, `cancelled` and `failed` are
+     * terminal — retiming any of them would be inventing a resurrection path nobody has designed,
+     * and `activate` already exists for the one case where bringing a row back is intended.
+     */
+    const retimable = [STATUS.Pending, STATUS.WaitingExecutionApproval];
+    if (!retimable.includes(row.status)) {
+      return json(409, {
+        error: `cannot retime a schedule that is ${row.status}`,
+        retimable,
+      });
+    }
+
+    const triggerAt = new Date(body.triggerAt).toISOString();
+
+    // `retimePatch` re-anchors a recurring chain; see its note for why that is not optional.
+    const updated = await transition(
+      row.id,
+      row.status,
+      row.status,
+      retimePatch(row, triggerAt)
+    );
+    if (!updated) return json(409, { error: 'status changed while retiming' });
+
+    // A parked row has no timer and must not get one — that is what `activate` is for.
+    const timer =
+      updated.status === STATUS.Pending
+        ? await updateSchedule(updated)
+        : { firesAt: null };
+
+    const clamped = timer.firesAt !== null && timer.firesAt !== triggerAt;
+
+    log('api', clamped ? 'retimedIntoThePast' : 'retimed', {
+      scheduleId: row.id,
+      from: row.triggerAt,
+      to: triggerAt,
+      firesAt: timer.firesAt,
+    });
+
+    return json(200, {
+      scheduleId: row.id,
+      status: updated.status,
+      triggerAt,
+      firesAt: timer.firesAt,
+      // Said plainly rather than left for the caller to compare: a time already gone cannot be
+      // given to `at()`, so the fire happens at the earliest moment Scheduler accepts instead.
+      clamped,
     });
   },
 

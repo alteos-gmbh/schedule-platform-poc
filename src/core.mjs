@@ -27,6 +27,7 @@ import {
   GetScheduleCommand,
   ListSchedulesCommand,
   SchedulerClient,
+  UpdateScheduleCommand,
 } from '@aws-sdk/client-scheduler';
 import {
   CloudWatchLogsClient,
@@ -402,40 +403,77 @@ export const scheduleNameFor = (id) => `poc-schedule-${id}`;
  * 07.09.2026 — see docs/consistency.md. A `ClientToken` changes nothing here and is not sent.
  */
 export async function createSchedule(row) {
-  const name = scheduleNameFor(row.id);
+  const { input, firesAt } = scheduleDefinition(row);
 
-  // The floor applies only when `triggerAt` is nearer than the minimum lead — normally because the
-  // occurrence is a repair whose time has already passed. A schedule that is far enough out keeps
-  // its own time exactly, so `period` is honoured as written all the way down to seconds.
+  try {
+    await scheduler.send(new CreateScheduleCommand(input));
+    return { created: true, name: input.Name, firesAt };
+  } catch (error) {
+    if (error.name === 'ConflictException') {
+      return { created: false, name: input.Name, firesAt };
+    }
+    throw error;
+  }
+}
+
+/**
+ * Move an existing timer to the row's current `triggerAt`.
+ *
+ * `UpdateSchedule` is a full replace rather than a merge, so the whole definition goes back every
+ * time — the design's README flags this for whoever writes `PATCH`, and the reason it is not a
+ * problem here is that this function owns the definition and never has to read one first.
+ *
+ * A missing timer falls through to a create. That happens when the row is `pending` but its timer
+ * was lost, or when a parked row is being retimed before it ever had one — a retime that failed
+ * because there was nothing to update would be a strange way to learn that.
+ */
+export async function updateSchedule(row) {
+  const { input, firesAt } = scheduleDefinition(row);
+
+  try {
+    await scheduler.send(new UpdateScheduleCommand(input));
+    return { updated: true, name: input.Name, firesAt };
+  } catch (error) {
+    if (error.name !== 'ResourceNotFoundException') throw error;
+    const created = await createSchedule(row);
+    return { updated: false, ...created };
+  }
+}
+
+/**
+ * The full one-shot definition for a row, and the one place the lead time is applied.
+ *
+ * `firesAt` is returned alongside because it is not always `triggerAt`: a time already in the past
+ * — a repair, or a retime aimed backwards — cannot be given to `at()`, so it is pushed to the
+ * earliest moment Scheduler will accept. The row keeps the requested time because the row records
+ * intent; the caller is told when the fire will actually happen.
+ */
+function scheduleDefinition(row) {
   const wanted = DateTime.fromISO(String(row.triggerAt)).toUTC();
   const floor = DateTime.utc().plus({ seconds: env.minLeadSeconds });
+  const when = wanted > floor ? wanted : floor;
 
   // Second precision, formatted explicitly. Scheduler rejects an `at()` carrying fractional
   // seconds — `Invalid Schedule Expression at(2026-09-08T03:54:26.439)` — and luxon's
   // `suppressMilliseconds` only drops them when they happen to be zero, so it is not a fix.
-  const at = (wanted > floor ? wanted : floor).toFormat("yyyy-MM-dd'T'HH:mm:ss");
-
-  try {
-    await scheduler.send(
-      new CreateScheduleCommand({
-        Name: name,
-        GroupName: env.group,
-        ScheduleExpression: `at(${at})`,
-        ScheduleExpressionTimezone: 'UTC',
-        FlexibleTimeWindow: { Mode: 'OFF' },
-        ActionAfterCompletion: 'DELETE',
-        Target: {
-          Arn: env.functionArn,
-          RoleArn: env.schedulerRoleArn,
-          Input: JSON.stringify({ scheduleId: row.id }),
-        },
-      })
-    );
-    return { created: true, name };
-  } catch (error) {
-    if (error.name === 'ConflictException') return { created: false, name };
-    throw error;
-  }
+  // Kept apart from the command input: an extra key on an SDK command shape is silently dropped
+  // today and is not something to rely on tomorrow.
+  return {
+    firesAt: when.toISO(),
+    input: {
+      Name: scheduleNameFor(row.id),
+      GroupName: env.group,
+      ScheduleExpression: `at(${when.toFormat("yyyy-MM-dd'T'HH:mm:ss")})`,
+      ScheduleExpressionTimezone: 'UTC',
+      FlexibleTimeWindow: { Mode: 'OFF' },
+      ActionAfterCompletion: 'DELETE',
+      Target: {
+        Arn: env.functionArn,
+        RoleArn: env.schedulerRoleArn,
+        Input: JSON.stringify({ scheduleId: row.id }),
+      },
+    },
+  };
 }
 
 export async function deleteSchedule(id) {
@@ -611,6 +649,25 @@ export const splitStatuses = (value) =>
     .flatMap((item) => String(item).split(','))
     .map((item) => item.trim())
     .filter(Boolean);
+
+/**
+ * The row patch for a retime.
+ *
+ * Separated out and tested because it is the part that fails quietly. A recurring row computes its
+ * next occurrence as `beginAt + period × (counter + 1)`, so moving `triggerAt` without moving
+ * `beginAt` leaves the chain anchored to the time the schedule used to have: the retime looks
+ * correct, and then the occurrence after it jumps back to the old rhythm. A one-shot row has no
+ * anchor to move.
+ */
+export function retimePatch(row, triggerAt) {
+  const recurring = row.period !== null && row.period !== undefined;
+  return recurring
+    ? { triggerAt, processingData: { beginAt: triggerAt, counter: 0 } }
+    : { triggerAt };
+}
+
+/** Exported for the retime route, which validates one date rather than a whole body. */
+export const validateIsoDate = (value) => isIsoDate(value);
 
 export const asArray = (value) =>
   value === undefined || value === null

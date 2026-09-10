@@ -189,8 +189,8 @@
         <h2>Create a schedule</h2>
         <div class="grid">
           <div>
-            <label for="afterMinutes">fire after (minutes)</label>
-            <input id="afterMinutes" type="number" value="1" min="1" step="1" />
+            <label for="afterMinutes">fire after (minutes, negative = in the past)</label>
+            <input id="afterMinutes" type="number" value="1" step="1" />
           </div>
           <div>
             <label for="startAt">startAt — computed</label>
@@ -310,7 +310,7 @@
        */
       const startAtFor = () =>
         new Date(
-          Date.now() + Math.max(1, Number($('afterMinutes').value) || 1) * 60_000
+          Date.now() + (Number($('afterMinutes').value) || 0) * 60_000
         ).toISOString();
 
       const showStartAt = () => {
@@ -426,6 +426,19 @@
               button('cancel', () =>
                 api('POST', '/schedule/cancel', { scheduleIds: [row.id] })
               ),
+              // Retimes to whatever "fire after (minutes)" says right now, so one field drives both
+              // creating and moving and there is nothing extra on screen to explain.
+              button('retime', async () => {
+                const { status, data } = await api('POST', '/schedule/update', {
+                  scheduleId: row.id,
+                  triggerAt: startAtFor(),
+                });
+                $('createResult').textContent =
+                  status === 200
+                    ? `${short(row.id)} retimed to ${data.triggerAt}` +
+                      (data.clamped ? ` — already past, fires ${data.firesAt}` : '')
+                    : `${status}: ${data.error ?? JSON.stringify(data)}`;
+              }),
               // The two below break the platform on purpose: one takes the timer away from a live
               // row, the other takes the row away from a live timer. Both are what the reconciler
               // is for, and neither is something a caller could ever do.

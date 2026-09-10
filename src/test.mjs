@@ -41,6 +41,7 @@ const {
   validateCancel,
   validateCreateSimple,
   newSimpleRow,
+  retimePatch,
 } = await import('./core.mjs');
 
 const tests = [];
@@ -291,6 +292,42 @@ test('a blank period makes a one-shot row, and no processingData with it', () =>
     beginAt: '2026-10-01T09:00:00.000Z',
     counter: 0,
   });
+});
+
+test('retiming a recurring row moves its anchor, or the next occurrence undoes the retime', () => {
+  const row = {
+    period: 'P1M',
+    triggerAt: '2026-01-31T09:00:00.000Z',
+    processingData: { beginAt: '2026-01-31T09:00:00.000Z', counter: 4 },
+  };
+
+  const moved = retimePatch(row, '2026-06-15T09:00:00.000Z');
+  assert.equal(moved.triggerAt, '2026-06-15T09:00:00.000Z');
+  assert.deepEqual(moved.processingData, {
+    beginAt: '2026-06-15T09:00:00.000Z',
+    counter: 0,
+  });
+
+  // Proof the anchor is what matters: with the old anchor kept, the next occurrence lands back on
+  // the original rhythm and the retime is silently undone one fire later.
+  const ifAnchorKept = calculateNextTriggerDate({
+    ...row,
+    triggerAt: moved.triggerAt,
+  });
+  assert.equal(ifAnchorKept.slice(0, 7), '2026-06', 'old anchor + 5 months');
+
+  const withNewAnchor = calculateNextTriggerDate({
+    ...row,
+    ...moved,
+  });
+  assert.equal(withNewAnchor.slice(0, 10), '2026-07-15', 'new anchor + one month');
+});
+
+test('retiming a one-shot row touches nothing but the time', () => {
+  assert.deepEqual(
+    retimePatch({ period: null, triggerAt: '2026-01-01T00:00:00.000Z' }, '2026-02-02T00:00:00.000Z'),
+    { triggerAt: '2026-02-02T00:00:00.000Z' }
+  );
 });
 
 // -----------------------------------------------------------------------------------------------
