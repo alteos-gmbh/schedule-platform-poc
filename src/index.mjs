@@ -21,6 +21,7 @@ import {
   newRow,
   putRow,
   queryByPolicy,
+  queueDepth,
   readLogs,
   scanRows,
   setConfig,
@@ -253,6 +254,9 @@ const ROUTES = {
     await drainQueue(env.queueUrl, FEED_FIRED);
     const fired = await drainQueue(env.fifoQueueUrl, FEED_FIRED);
 
+    // Depth first: `drainQueue` empties the queue, so asking afterwards always answers zero.
+    const dlqDepth = await queueDepth(env.dlqUrl);
+
     const [rows, schedules, dlq, config, logs] = await Promise.all([
       scanRows(),
       listSchedules(),
@@ -274,6 +278,7 @@ const ROUTES = {
       schedules,
       fired,
       dlq,
+      dlqDepth,
       logs,
     });
   },

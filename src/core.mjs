@@ -34,6 +34,7 @@ import {
 } from '@aws-sdk/client-cloudwatch-logs';
 import {
   DeleteMessageCommand,
+  GetQueueAttributesCommand,
   ReceiveMessageCommand,
   SendMessageCommand,
   SQSClient,
@@ -898,5 +899,28 @@ function shapeLogLine(event) {
     };
   } catch {
     return { at: event.timestamp, kind: 'raw', text: raw.slice(0, 300) };
+  }
+}
+
+/**
+ * How many messages are actually on a queue right now.
+ *
+ * Worth showing beside the feed, because the feed is not the queue. Draining is what lets a browser
+ * poll the same dead letter every two seconds without consuming it from under anyone, but it also
+ * means the real queue is empty within a poll of a record arriving — and someone opening SQS in the
+ * console to check finds nothing there. Reporting both numbers stops the panel from implying the
+ * messages are still in AWS.
+ */
+export async function queueDepth(queueUrl) {
+  try {
+    const { Attributes } = await sqs.send(
+      new GetQueueAttributesCommand({
+        QueueUrl: queueUrl,
+        AttributeNames: ['ApproximateNumberOfMessages'],
+      })
+    );
+    return Number(Attributes?.ApproximateNumberOfMessages ?? 0);
+  } catch {
+    return null;
   }
 }

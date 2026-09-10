@@ -200,3 +200,6 @@ Invalid Schedule Expression at(2026-09-08T03:54:26.439).
 - Chưa có gì ở đây được load-test, và quota schedule trên mỗi account của Scheduler chưa được đo đối chiếu với số policy đang sống. Đó là một câu hỏi mở thật, không phải một câu đã giải.
 - Hình dạng trust policy chưa chốt — xem mục 11. Ba cách giải thích đã được thử và mỗi cái bị phép đo sau phủ định.
 - Một fire được retry có thể publish nhiều lần. Xem mục 4.
+- **Panel dead letter không phải queue.** Mỗi lần poll, các bản ghi mới được chuyển từ SQS sang DynamoDB để trang có thể hiện cùng một bản ghi mỗi 2 giây mà không tiêu thụ nó của người khác — nghĩa là queue thật rỗng chỉ sau một nhịp poll, và mở SQS trong AWS console sẽ không thấy gì. Panel hiện độ sâu thật của queue cạnh số bản ghi đã hút, đúng vì lý do đó.
+
+  **Không được port cách này.** `docs/consistency.md` có runbook redrive dead letter — *"re-invoking the dispatcher with a `scheduleId` is safe by construction"* — và nó dựa trên việc message **vẫn còn trong SQS**. Một console tự ăn dead-letter queue của mình là phá luôn đường phục hồi mà thiết kế trông vào.

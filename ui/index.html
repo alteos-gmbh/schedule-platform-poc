@@ -282,10 +282,11 @@
           </section>
 
           <section>
-            <h2>Dead letters — Lambda's failure destination</h2>
+            <h2>Dead letters — captured from the queue</h2>
             <ul class="feed" id="dlq">
               <li class="empty">nothing yet</li>
             </ul>
+            <p class="note" id="dlqNote"></p>
           </section>
         </div>
 
@@ -577,6 +578,12 @@
             item.kind
           )}</span> ${escapeHtml(item.text)}${detail}`;
         });
+
+        // Say where the messages are. Opening SQS and finding it empty is otherwise alarming.
+        $('dlqNote').textContent =
+          `on the queue right now: ${data.dlqDepth ?? '?'} — each poll moves new records out of ` +
+          `SQS into DynamoDB so the page can show them without consuming them from under anyone. ` +
+          `An empty queue in the AWS console is this working, not records lost.`;
 
         renderFeed('dlq', data.dlq, (item) => {
           const reason =

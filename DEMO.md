@@ -265,3 +265,13 @@ Set **messageTopicName** to `policy-obligations.fifo`. Fires route to the FIFO q
 - The trust-policy form is unsettled — see 11. Three explanations were tried and each was
   disproved by the next measurement.
 - A retried fire can publish twice. See 4.
+- **The dead-letter panel is not the queue.** Each poll moves new records out of SQS into DynamoDB
+  so a browser can show the same record every two seconds without consuming it from under anyone —
+  which means the real queue is empty within a poll of a record arriving, and opening SQS in the AWS
+  console finds nothing. The panel reports the live depth beside the captured records for exactly
+  that reason.
+
+  This shortcut must not be ported. `docs/consistency.md` has the runbook redriving dead letters —
+  "re-invoking the dispatcher with a `scheduleId` is safe by construction" — and that depends on the
+  messages still being in SQS. A console that eats its own dead-letter queue destroys the recovery
+  path the design relies on.
