@@ -181,27 +181,36 @@ function readBody(request) {
  * and a region; the function itself holds every other setting.
  */
 function readTerraformOutputs() {
-  const fromTerraform = tryTerraformOutputs();
-  if (fromTerraform) return fromTerraform;
-
   const functionName = process.env.POC_FUNCTION_NAME;
   const region = process.env.AWS_REGION ?? process.env.AWS_DEFAULT_REGION;
 
+  /**
+   * The environment wins when it names a function, and the order matters.
+   *
+   * Terraform output is the convenient default on the machine that applied the stack, but it
+   * answers for whichever workspace happens to be selected — so with two stacks live it cannot be
+   * used to point one console at one of them. Explicit beats inferred: set POC_FUNCTION_NAME and
+   * this console serves that function whatever the state directory says.
+   */
   if (functionName && region) {
     return {
       function_name: functionName,
       region,
-      account_id: process.env.POC_ACCOUNT_ID ?? '(unknown)',
-      table_name: process.env.POC_TABLE ?? '(unknown)',
-      schedule_group: process.env.POC_SCHEDULE_GROUP ?? '(unknown)',
+      account_id: process.env.POC_ACCOUNT_ID ?? '(from env)',
+      table_name: process.env.POC_TABLE ?? '(from env)',
+      schedule_group: process.env.POC_SCHEDULE_GROUP ?? '(from env)',
     };
   }
+
+  const fromTerraform = tryTerraformOutputs();
+  if (fromTerraform) return fromTerraform;
 
   console.error(
     'No stack outputs and no environment fallback.\n\n' +
       'On the machine that applied the stack:\n' +
       '  cd infra && terraform apply -var expected_account_id=<account>\n\n' +
-      'On any other machine, point the console at the already-deployed function:\n' +
+      'Or point this console at a deployed function directly, which also overrides\n' +
+      'whichever Terraform workspace is selected:\n' +
       '  POC_FUNCTION_NAME=poc-schedule AWS_REGION=eu-central-1 npm run console\n'
   );
   process.exit(1);

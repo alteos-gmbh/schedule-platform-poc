@@ -58,6 +58,63 @@ Tear it down when the demo is over. Nothing is protected against deletion, delib
 cd infra && terraform destroy -var expected_account_id=<your account>
 ```
 
+### Two versions side by side
+
+A tunnel is a pipe to `localhost`, not a deployment — so two links do not by themselves give two
+versions. What differs decides how much work it is.
+
+**If only the page changed**, one function serves both. Check the frozen commit out beside the
+working copy and run a second console against the same function:
+
+```sh
+git worktree add ../poc-frozen <commit>
+cd ../poc-frozen/src && npm install && cd ..
+npm install
+PORT=8787 POC_FUNCTION_NAME=poc-schedule AWS_REGION=eu-central-1 npm run console
+```
+
+Both consoles then show the same rows, because they invoke the same function and read the same
+table.
+
+**If the handler changed**, the function is one AWS resource and an apply overwrites it — the old
+link's behaviour changes with the new one. Two versions means two stacks, which every resource name
+already supports:
+
+```sh
+cd infra
+terraform workspace new v2
+terraform apply -var expected_account_id=<account> -var name_prefix=poc-schedule-v2
+```
+
+That is a separate table, queues, schedule group, role and function. Point the second console at it:
+
+```sh
+PORT=8788 POC_FUNCTION_NAME=poc-schedule-v2 AWS_REGION=eu-central-1 npm run console
+```
+
+`POC_FUNCTION_NAME` overrides whichever Terraform workspace is selected, which is the only way to
+serve two stacks from one checkout.
+
+Then a tunnel each:
+
+```sh
+cloudflared tunnel --url http://localhost:8787   # the frozen link
+cloudflared tunnel --url http://localhost:8788   # the new one
+```
+
+Two things to know. A quick tunnel's URL is random and changes every time `cloudflared` restarts, so
+neither link survives a restart — a stable address needs a named tunnel, which needs a Cloudflare
+account and a domain. And remember the second stack when tearing down:
+
+```sh
+terraform workspace select v2 && terraform destroy -var expected_account_id=<account> -var name_prefix=poc-schedule-v2
+terraform workspace select default && terraform destroy -var expected_account_id=<account>
+```
+
+Two isolated stacks also fix something that bit this PoC repeatedly: with one stack, everybody
+shares one table, so `reset everything`, the demo switches and `drop row` all reach into whatever
+someone else is watching.
+
 ### Letting other people watch it
 
 The page is static, but the proxy is the part that holds AWS credentials and makes the
