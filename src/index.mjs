@@ -17,6 +17,8 @@ import {
   FEED_FIRED,
   forceStatus,
   getConfig,
+  getRow,
+  newSimpleRow,
   listSchedules,
   newRow,
   putRow,
@@ -31,6 +33,7 @@ import {
   validateActivate,
   validateCancel,
   validateCancelPolicy,
+  validateCreateSimple,
   validateCreateV1,
   validateCreateV2,
   validateGet,
@@ -69,7 +72,11 @@ const isReconciler = (event) =>
 export async function handler(event) {
   const log = (component, message, detail = {}) => {
     // The shape is logged and never a whole payload: a schedule context can hold customer data.
-    console.log(JSON.stringify({ component, message, ...detail }));
+    //
+    // `detail` is spread first so it can never shadow `component` or `message`. It did once: a
+    // detail carrying its own `message` key silently replaced the label, and the line still looked
+    // plausible enough that the loss went unnoticed.
+    console.log(JSON.stringify({ ...detail, component, message }));
   };
 
   if (isHttpInvoke(event)) return route(event, log);
@@ -124,6 +131,53 @@ async function route(event, log) {
 // ---------------------------------------------------------------------------------------------
 
 const ROUTES = {
+  /**
+   * The dumb-service surface. Three routes, no domain: create one schedule, cancel some by id,
+   * release some by id. The `/v1` and `/v2` routes below are the ported inbound surface of the
+   * service being replaced and are left alone; the console simply stopped using them.
+   */
+  'POST /schedule': async ({ body, log }) => {
+    const errors = validateCreateSimple(body);
+    if (errors.length) return badRequest(errors);
+
+    const row = newSimpleRow(body);
+    await putRow(row);
+    await createSchedule(row);
+
+    log('api', 'created', {
+      scheduleId: row.id,
+      triggerAt: row.triggerAt,
+      period: row.period,
+    });
+
+    return json(201, {
+      created: [{ id: row.id, status: row.status, triggerAt: row.triggerAt }],
+    });
+  },
+
+  'POST /schedule/cancel': async ({ body, log }) => {
+    const ids = Array.isArray(body?.scheduleIds) ? body.scheduleIds : [];
+    if (ids.length === 0) return badRequest(['scheduleIds must be a non-empty array']);
+
+    const cancelled = [];
+    for (const id of ids) {
+      const row = await getRow(id);
+      if (!row) continue;
+      // Only a pending row can be cancelled — an executed one has already fired and a failed one
+      // is terminal. Same guard the policy-wide cancel used, just addressed by id.
+      const updated = await transition(id, STATUS.Pending, STATUS.Cancelled);
+      if (!updated) continue;
+      await deleteSchedule(id);
+      cancelled.push(id);
+      log('api', 'cancelled', { scheduleId: id });
+    }
+
+    return json(200, { cancelled });
+  },
+
+  'POST /schedule/activate': async ({ body, log }) =>
+    activate(body?.scheduleIds, log),
+
   'GET /v1/health': async () =>
     json(200, { service: 'schedule-platform-poc', status: 'ok' }),
 
@@ -226,19 +280,7 @@ const ROUTES = {
   'POST /v1/schedule/activate': async ({ body, log }) => {
     const errors = validateActivate(body);
     if (errors.length) return badRequest(errors);
-
-    let affectedCount = 0;
-    for (const id of body.scheduledActionIds) {
-      const row = await forceStatus(id, STATUS.Pending);
-      if (!row?.id) continue;
-      affectedCount += 1;
-      await createSchedule(row);
-      log('api', 'activated', { scheduleId: id, triggerAt: row.triggerAt });
-    }
-
-    return json(200, {
-      message: `Schedule Action items activated, affected count : ${affectedCount}`,
-    });
+    return activate(body.scheduledActionIds, log);
   },
 
   // -------------------------------------------------------------------------------------------
@@ -246,13 +288,23 @@ const ROUTES = {
   // would carry — it exists so a room full of people can watch the platform work.
   // -------------------------------------------------------------------------------------------
 
-  'GET /_debug/state': async () => {
+  'GET /_debug/state': async ({ log }) => {
     // The two target queues drain into ONE feed row, so they must not run concurrently: each drain
     // reads the feed, prepends, and writes it back, and in parallel both would read the same
     // starting point and the later write would drop the other's messages. Losing a fired message
     // from the display mid-demo is the one bug here nobody would be able to explain on the spot.
-    await drainQueue(env.queueUrl, FEED_FIRED);
-    const fired = await drainQueue(env.fifoQueueUrl, FEED_FIRED);
+    // The delivered text is the log line's own label, deliberately: what a room wants to read is
+    // the message coming out the far end, not the word "received" with the message buried in a
+    // detail blob beside it.
+    const consumed = (entry) =>
+      log(
+        'consumer',
+        entry.body?.payload?.message ?? entry.body?.topicName ?? 'received',
+        { scheduleId: entry.body?.payload?.scheduleId }
+      );
+
+    await drainQueue(env.queueUrl, FEED_FIRED, consumed);
+    const fired = await drainQueue(env.fifoQueueUrl, FEED_FIRED, consumed);
 
     // Depth first: `drainQueue` empties the queue, so asking afterwards always answers zero.
     const dlqDepth = await queueDepth(env.dlqUrl);
@@ -260,7 +312,11 @@ const ROUTES = {
     const [rows, schedules, dlq, config, logs] = await Promise.all([
       scanRows(),
       listSchedules(),
-      drainQueue(env.dlqUrl, FEED_DLQ),
+      drainQueue(env.dlqUrl, FEED_DLQ, (entry) =>
+        log('consumer', 'deadLetterCaptured', {
+          scheduleId: entry.body?.requestPayload?.scheduleId,
+        })
+      ),
       getConfig(),
       readLogs(),
     ]);
@@ -382,6 +438,30 @@ async function create(items, options, log) {
   }
 
   return json(201, { created });
+}
+
+/**
+ * Release rows by id, and mint the timer a parked row never had.
+ *
+ * Unconditional on the current status, which is what the old handler did — it updates by
+ * `id IN (...)` with no status predicate, so activating an already-cancelled row resurrects it.
+ * Reproduced rather than corrected, and shared by both routes so the two cannot drift.
+ */
+async function activate(ids, log) {
+  if (!Array.isArray(ids)) return badRequest(['ids must be an array']);
+
+  let affectedCount = 0;
+  for (const id of ids) {
+    const row = await forceStatus(id, STATUS.Pending);
+    if (!row?.id) continue;
+    affectedCount += 1;
+    await createSchedule(row);
+    log('api', 'activated', { scheduleId: id, triggerAt: row.triggerAt });
+  }
+
+  return json(200, {
+    message: `Schedule Action items activated, affected count : ${affectedCount}`,
+  });
 }
 
 /** Cancel is two writes that must both happen: the row is the truth, the timer is the side effect. */

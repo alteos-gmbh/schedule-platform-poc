@@ -7,10 +7,16 @@ and line behind it, so a disagreement in the room can be settled by opening the 
 
 Start the console (`npm run console`), open <http://localhost:8787>, press **reset everything**.
 
-The create form shows only what a room needs to follow: when it fires, how often, and the policy
-it belongs to. Shape, `messageTopicName` and `context.command` are still there and still drive the
-call, just hidden — every visible field is one more thing to explain. The right-hand panel is the
-function's own log, so the line that changed a row sits beside the row changing.
+The create form is two questions: how many minutes from now, and what to say. `startAt` is
+computed and shown rather than typed. The right-hand panel is the function's own log, so the line
+that changed a row sits beside the row changing — including the delivered message coming back out
+of the queue.
+
+**No policy, partner, command or topic.** What is under question is the platform: the store as the
+source of truth, the timer as only a timer, and what retry, dead-lettering and reconciliation do.
+The domain fields were noise in front of that. The ported inbound surface of the old service still
+exists on the `/v1` and `/v2` routes and in the table below — it is documented rather than
+demonstrated, and the `demo1` branch holds the version whose console drove it.
 
 ---
 

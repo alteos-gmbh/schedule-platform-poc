@@ -149,7 +149,7 @@
       .log-dispatch { color: var(--accent); }
       .log-reconciler { color: var(--ok); }
       .log-api { color: var(--muted); }
-      .log-report { color: var(--muted); }
+      .log-consumer { color: var(--ok); font-weight: 700; }
       .log-bad { color: var(--bad); }
       .feed li { border-bottom: 1px solid var(--line); padding: 7px 0; font-family: var(--mono); font-size: 12px; }
       .feed time { color: var(--muted); }
@@ -188,64 +188,32 @@
       <section class="wide">
         <h2>Create a schedule</h2>
         <div class="grid">
-          <!--
-            Hidden, not removed. The values still drive the create call; they are out of the way
-            because a room does not need to see them to follow what the platform does, and every
-            visible field is one more thing a presenter has to explain.
-
-            The topic and command defaults are the inert pair on purpose: `processObligation` sends
-            the dispatcher into its conclude-sibling lookup, which logs
-            `processObligationWithoutConclude` on every fire and reads as an error in the log panel
-            when it is nothing of the kind.
-          -->
-          <div hidden>
-            <label for="version">shape</label>
-            <select id="version">
-              <option value="v1">v1 — messageTopicName + context</option>
-              <option value="v2">v2 — opaque message</option>
-            </select>
+          <div>
+            <label for="afterMinutes">fire after (minutes)</label>
+            <input id="afterMinutes" type="number" value="1" min="1" step="1" />
           </div>
           <div>
-            <label for="inSeconds">fires in (seconds)</label>
-            <input id="inSeconds" type="number" value="60" min="5" />
+            <label for="startAt">startAt — computed</label>
+            <input id="startAt" class="mono" readonly tabindex="-1" />
           </div>
           <div>
-            <label for="period">period (ISO 8601 duration, blank = one-shot; PT15S works)</label>
+            <label for="message">message to deliver</label>
+            <input id="message" value="hello everyone" maxlength="500" />
+          </div>
+          <div>
+            <label for="period">repeat every (blank = fire once)</label>
             <input id="period" value="PT1M" />
-          </div>
-          <div>
-            <label for="endAt">endAt (blank = never ends)</label>
-            <input id="endAt" placeholder="2026-09-09T00:00:00.000Z" />
-          </div>
-          <div hidden>
-            <label for="topic">messageTopicName</label>
-            <input id="topic" value="accounting-jobs" />
-          </div>
-          <div hidden>
-            <label for="command">context.command</label>
-            <input id="command" value="processCollection" />
-          </div>
-          <div>
-            <label for="policyId">context.policyId</label>
-            <input id="policyId" class="mono" />
-          </div>
-          <div>
-            <label for="partnerId">context.partnerId</label>
-            <input id="partnerId" class="mono" />
           </div>
         </div>
         <p class="row" style="margin-top: 14px">
           <button class="primary" id="create">create</button>
-          <label style="display: flex; gap: 6px; align-items: center; margin: 0; color: var(--ink)">
-            <input type="checkbox" id="waitForApproval" style="width: auto" />
-            __waitForApproval
-          </label>
-          <button id="newPolicy">new policy id</button>
           <span class="note" id="createResult"></span>
         </p>
         <p class="note">
-          Synthetic ids only. Never paste a real policy or partner id into this console — a schedule
-          context reaches the queue and the logs.
+          No policy, partner or command: this is a timer that delivers a message. What is under
+          question is the platform — the store as the source of truth, the timer as only a timer,
+          and what retry, dead-lettering and reconciliation do. The domain fields were noise in
+          front of that.
         </p>
       </section>
 
@@ -257,6 +225,7 @@
               <tr>
                 <th>id</th>
                 <th>status</th>
+                <th>message</th>
                 <th>triggerAt</th>
                 <th>period</th>
                 <th>counter</th>
@@ -266,7 +235,7 @@
               </tr>
             </thead>
             <tbody id="rows">
-              <tr><td colspan="8" class="empty">nothing yet</td></tr>
+              <tr><td colspan="9" class="empty">nothing yet</td></tr>
             </tbody>
           </table>
         </div>
@@ -333,49 +302,36 @@
       $('ident').textContent = `${config.functionName} · ${config.region} · account ${config.account}`;
 
       // ---- create ---------------------------------------------------------------------------
-      const freshPolicy = () => {
-        $('policyId').value = crypto.randomUUID();
-      };
-      freshPolicy();
-      $('partnerId').value = crypto.randomUUID();
-      $('newPolicy').addEventListener('click', freshPolicy);
 
-      $('create').addEventListener('click', async () => {
-        const triggerAt = new Date(
-          Date.now() + Number($('inSeconds').value) * 1000
+      /**
+       * `startAt` is shown rather than typed, because minutes-from-now is what a presenter thinks
+       * in and an ISO timestamp is what Scheduler needs. Recomputed on every keystroke and again
+       * at submit — reading it off a stale render would schedule the wrong second.
+       */
+      const startAtFor = () =>
+        new Date(
+          Date.now() + Math.max(1, Number($('afterMinutes').value) || 1) * 60_000
         ).toISOString();
 
-        const context = {
-          command: $('command').value,
-          partnerId: $('partnerId').value,
-          policyId: $('policyId').value,
-        };
-        if ($('waitForApproval').checked) context.__waitForApproval = true;
+      const showStartAt = () => {
+        $('startAt').value = startAtFor();
+      };
 
-        const item = { triggerAt };
-        if ($('period').value.trim()) item.period = $('period').value.trim();
-        if ($('endAt').value.trim()) item.endAt = $('endAt').value.trim();
+      showStartAt();
+      $('afterMinutes').addEventListener('input', showStartAt);
+      setInterval(showStartAt, 1000);
 
-        const v2 = $('version').value === 'v2';
-        if (v2) {
-          item.message = {
-            topicName: $('topic').value,
-            payload: { command: $('command').value, policyId: context.policyId },
-          };
-          item.context = context;
-        } else {
-          item.messageTopicName = $('topic').value;
-          item.context = context;
-        }
+      $('create').addEventListener('click', async () => {
+        const period = $('period').value.trim();
+        const { status, data } = await api('POST', '/schedule', {
+          triggerAt: startAtFor(),
+          message: $('message').value,
+          ...(period ? { period } : {}),
+        });
 
-        const { status, data } = await api(
-          'POST',
-          v2 ? '/v2/schedule' : '/v1/schedule',
-          [item]
-        );
         $('createResult').textContent =
           status === 201
-            ? `created ${data.created.map((c) => short(c.id)).join(', ')} as ${data.created[0].status}`
+            ? `created ${short(data.created[0].id)}, fires ${data.created[0].triggerAt}`
             : `${status}: ${JSON.stringify(data.errors ?? data)}`;
         refresh();
       });
@@ -429,7 +385,7 @@
       function renderRows(rows, timers, limits) {
         const body = $('rows');
         if (rows.length === 0) {
-          body.innerHTML = '<tr><td colspan="8" class="empty">nothing yet</td></tr>';
+          body.innerHTML = '<tr><td colspan="9" class="empty">nothing yet</td></tr>';
           return;
         }
 
@@ -452,6 +408,7 @@
             tr.innerHTML = `
               <td class="mono">${short(row.id)}</td>
               <td><span class="badge s-${row.status}">${row.status}</span></td>
+              <td>${escapeHtml(row.message ?? '—')}</td>
               <td class="mono">${row.triggerAt ?? ''}</td>
               <td class="mono">${row.period ?? '—'}</td>
               <td class="mono">${row.processingData?.counter ?? '—'}</td>
@@ -463,20 +420,15 @@
 
             const actions = tr.lastElementChild;
             actions.append(
-              button('cancel policy', () =>
-                api('DELETE', `/v2/schedule?policyId=${row.policyId}`)
-              ),
-              button('cancel command', () =>
-                api('POST', '/v1/schedule/cancel', {
-                  commands: [row.context?.command, row.context?.name].filter(Boolean),
-                  policyId: row.policyId,
-                })
-              ),
               button('activate', () =>
-                api('POST', '/v1/schedule/activate', {
-                  scheduledActionIds: [row.id],
-                })
+                api('POST', '/schedule/activate', { scheduleIds: [row.id] })
               ),
+              button('cancel', () =>
+                api('POST', '/schedule/cancel', { scheduleIds: [row.id] })
+              ),
+              // The two below break the platform on purpose: one takes the timer away from a live
+              // row, the other takes the row away from a live timer. Both are what the reconciler
+              // is for, and neither is something a caller could ever do.
               button('drop timer', () =>
                 api('POST', '/_debug/orphan', { scheduleId: row.id })
               ),
@@ -569,7 +521,9 @@
           const loud = LOUD.has(item.text) || item.kind === 'consoleError';
           const cls = loud
             ? 'log-bad'
-            : `log-${['dispatch', 'reconciler', 'api', 'report'].includes(item.kind) ? item.kind : 'api'}`;
+            : item.kind === 'consumer'
+              ? 'log-consumer'
+              : `log-${['dispatch', 'reconciler', 'api'].includes(item.kind) ? item.kind : 'api'}`;
           const clock = new Date(item.at).toISOString().slice(11, 19);
           const detail = item.detail
             ? `<pre>${escapeHtml(JSON.stringify(item.detail))}</pre>`

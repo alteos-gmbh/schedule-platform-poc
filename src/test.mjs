@@ -39,6 +39,8 @@ const {
   validateCreateV1,
   validateCreateV2,
   validateCancel,
+  validateCreateSimple,
+  newSimpleRow,
 } = await import('./core.mjs');
 
 const tests = [];
@@ -228,6 +230,64 @@ test('an absent period still produces processingData, because the guard tests !=
   );
   assert.equal(row.period, null);
   assert.deepEqual(row.processingData, {
+    beginAt: '2026-10-01T09:00:00.000Z',
+    counter: 0,
+  });
+});
+
+// -----------------------------------------------------------------------------------------------
+// The dumb-service shape the console now uses
+// -----------------------------------------------------------------------------------------------
+
+test('a simple create needs a triggerAt and a message, and nothing else', () => {
+  assert.deepEqual(
+    validateCreateSimple({
+      triggerAt: '2026-10-01T09:00:00.000Z',
+      message: 'hello everyone',
+    }),
+    []
+  );
+
+  assert.ok(validateCreateSimple({ message: 'x' }).length > 0, 'no triggerAt');
+  assert.ok(
+    validateCreateSimple({ triggerAt: '2026-10-01T09:00:00.000Z' }).length > 0,
+    'no message'
+  );
+  assert.ok(
+    validateCreateSimple({
+      triggerAt: '2026-10-01T09:00:00.000Z',
+      message: '   ',
+    }).length > 0,
+    'blank message'
+  );
+  assert.ok(
+    validateCreateSimple({
+      triggerAt: '2026-10-01T09:00:00.000Z',
+      message: 'x',
+      period: 'every minute',
+    }).length > 0,
+    'period still has to be an ISO duration'
+  );
+});
+
+test('a blank period makes a one-shot row, and no processingData with it', () => {
+  const once = newSimpleRow({
+    triggerAt: '2026-10-01T09:00:00.000Z',
+    message: 'hello',
+    period: '',
+  });
+  assert.equal(once.period, null);
+  assert.equal(once.processingData, undefined);
+  assert.equal(once.kind, 'simple');
+  assert.equal(once.deliveries, 1);
+
+  const repeating = newSimpleRow({
+    triggerAt: '2026-10-01T09:00:00.000Z',
+    message: 'hello',
+    period: 'PT1M',
+  });
+  assert.equal(repeating.period, 'PT1M');
+  assert.deepEqual(repeating.processingData, {
     beginAt: '2026-10-01T09:00:00.000Z',
     counter: 0,
   });

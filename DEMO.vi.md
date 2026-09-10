@@ -6,7 +6,9 @@ Mười một hành vi cần bao phủ và mười một thứ cần cho xem. M�
 
 Chạy console (`npm run console`), mở <http://localhost:8787>, bấm **reset everything**.
 
-Form tạo chỉ hiện những gì cả phòng cần theo dõi: bắn khi nào, bao lâu một lần, thuộc policy nào. Shape, `messageTopicName` và `context.command` vẫn còn và vẫn điều khiển lệnh gọi, chỉ là ẩn đi — mỗi field hiện ra là một thứ nữa phải giải thích. Panel bên phải là log của chính function, nên dòng log làm đổi một row nằm ngay cạnh row đó.
+Form tạo là hai câu hỏi: bao nhiêu phút nữa, và nói gì. `startAt` được tính và hiện ra chứ không phải gõ vào. Panel bên phải là log của chính function, nên dòng log làm đổi một row nằm ngay cạnh row đó — kể cả message được giao quay trở ra từ queue.
+
+**Không có policy, partner, command hay topic.** Thứ đang bị chất vấn là platform: store là nguồn sự thật, timer chỉ là timer, và retry / dead-letter / reconcile làm gì. Các field domain là tiếng ồn đứng trước nó. Bề mặt inbound đã port của service cũ vẫn còn ở các route `/v1`, `/v2` và trong bảng phía dưới — nó được **ghi lại** chứ không còn **trình diễn** được, và branch `demo1` giữ bản mà console điều khiển nó.
 
 ---
 

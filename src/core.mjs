@@ -495,6 +495,30 @@ const isUuid = (value) => typeof value === 'string' && UUID_REGEX.test(value);
 const isPlainObject = (value) =>
   typeof value === 'object' && value !== null && !Array.isArray(value);
 
+/**
+ * POST /schedule — the dumb-service shape: when to fire, how often, and what to say.
+ *
+ * No policy, no partner, no command, no topic. This PoC exists to show the platform mechanics —
+ * the store as the source of truth, the timer as only a timer, and what retry, dead-lettering and
+ * reconciliation do — and the domain fields were noise in front of that. The ported inbound surface
+ * of the old service still lives on the `/v1` and `/v2` routes and in the demo scripts; nothing
+ * here removes it.
+ */
+export function validateCreateSimple(body) {
+  const errors = [];
+  if (!isPlainObject(body)) return ['body must be an object'];
+
+  if (!isIsoDate(body.triggerAt)) errors.push('triggerAt must be an ISO date');
+  if (body.period !== undefined && body.period !== null && !PERIOD_REGEX.test(String(body.period)))
+    errors.push('period must be an ISO 8601 duration');
+  if (typeof body.message !== 'string' || body.message.trim() === '')
+    errors.push('message is required');
+  if (typeof body.message === 'string' && body.message.length > 500)
+    errors.push('message must be 500 characters or fewer');
+
+  return errors;
+}
+
 /** POST /v1/schedule — an array, and `context` needs command/partnerId/policyId. */
 export function validateCreateV1(body) {
   const errors = [];
@@ -604,6 +628,38 @@ export const asArray = (value) =>
  * service queries `context.policyId` inside a JSONB column, which DynamoDB cannot index — this is
  * the one shape change the move to DynamoDB forces, and every read path uses the lifted copy.
  */
+/**
+ * A row for the dumb-service shape.
+ *
+ * `policyId` is still written because the `byPolicy` index needs a key, but it carries no meaning
+ * any more — every simple row shares one value, and reads go through the id or the status sweep.
+ * Removing the index would mean a Terraform change for nothing.
+ */
+export function newSimpleRow({ triggerAt, period, message }) {
+  const now = new Date().toISOString();
+  const at = DateTime.fromISO(String(triggerAt)).toUTC().toISO();
+  const recurring = period !== undefined && period !== null && String(period) !== '';
+
+  return {
+    id: randomUUID(),
+    policyId: SIMPLE_PARTITION,
+    kind: 'simple',
+    message: String(message),
+    status: STATUS.Pending,
+    period: recurring ? String(period) : null,
+    triggerAt: at,
+    processingData: recurring ? { beginAt: triggerAt, counter: 0 } : undefined,
+    attempts: 0,
+    deliveries: 1,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export const SIMPLE_PARTITION = 'poc';
+
+export const isSimpleRow = (row) => row.kind === 'simple';
+
 export function newRow(input, { v2 }) {
   const now = new Date().toISOString();
   const triggerAt = DateTime.fromISO(String(input.triggerAt)).toUTC().toISO();
@@ -724,7 +780,7 @@ const FEED_CAP = 40;
  * A queue is a bad display surface — a message read for the screen is gone for everyone else — so
  * each poll drains the queue once and appends to an item the UI can re-read as often as it likes.
  */
-export async function drainQueue(queueUrl, feedId) {
+export async function drainQueue(queueUrl, feedId, notify) {
   const received = [];
 
   for (let round = 0; round < 3; round += 1) {
@@ -739,10 +795,11 @@ export async function drainQueue(queueUrl, feedId) {
     if (Messages.length === 0) break;
 
     for (const message of Messages) {
-      received.push({
-        at: new Date().toISOString(),
-        body: safeParse(message.Body),
-      });
+      const entry = { at: new Date().toISOString(), body: safeParse(message.Body) };
+      received.push(entry);
+      // The caller logs it. Draining is the only place a message is ever read, so this is the
+      // closest thing the PoC has to a consumer, and a demo wants to see it happen.
+      notify?.(entry);
       await sqs.send(
         new DeleteMessageCommand({
           QueueUrl: queueUrl,

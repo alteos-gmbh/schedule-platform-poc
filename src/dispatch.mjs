@@ -20,6 +20,7 @@ import {
   env,
   getConfig,
   getRow,
+  isSimpleRow,
   isV2Row,
   listSchedules,
   publish,
@@ -81,13 +82,20 @@ export async function dispatch(scheduleId, log) {
    * topic for a V2 fire comes off the message, not out of the context — which also means a V2 row
    * naming a `.fifo` topic gets the same ordering guarantee a V1 row does.
    */
-  const message = isV2Row(claimed)
-    ? {
-        topicName: claimed.message?.topicName,
-        payload: claimed.message?.payload ?? claimed.message,
-        messageGroupId: claimed.message?.messageGroupId ?? claimed.policyId,
+  const message = isSimpleRow(claimed)
+    ? // The dumb-service shape: whatever the operator typed, plus the id it came from so a
+      // message on the queue can be traced back to the row that sent it.
+      {
+        topicName: 'poc-messages',
+        payload: { scheduleId: claimed.id, message: claimed.message },
       }
-    : buildV1Message(claimed);
+    : isV2Row(claimed)
+      ? {
+          topicName: claimed.message?.topicName,
+          payload: claimed.message?.payload ?? claimed.message,
+          messageGroupId: claimed.message?.messageGroupId ?? claimed.policyId,
+        }
+      : buildV1Message(claimed);
 
   try {
     if (config.breakTarget) {
@@ -199,7 +207,7 @@ async function buildNextOccurrence(row, log) {
     return null;
   }
 
-  if (!isV2Row(row) && row.context?.command === COMMAND.ProcessObligation) {
+  if (!isSimpleRow(row) && !isV2Row(row) && row.context?.command === COMMAND.ProcessObligation) {
     const siblings = await queryByPolicy(row.policyId);
     const conclude = siblings.find(
       (item) => item.context?.name === COMMAND.ConcludePolicy
