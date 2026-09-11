@@ -170,7 +170,7 @@ nobody has checked that they are. Worth a ticket.
 Turn on **break publish** only. Same shape as 4, with the error coming from the queue write. Shows
 that both failure paths land in the same place.
 
-## 5b — Retime, which the old service cannot do at all
+## 5b — Update, which the old service cannot do at all
 
 The lead's question was whether a business rule forbids changing a schedule's trigger time. It does
 not. There is simply no update endpoint, and the design already decided to add one — from
@@ -187,38 +187,63 @@ That workaround is visible in the code being replaced: `resyncTerminationSchedul
 termination actions "must be cancelled and recreated to fire at the new time", because a smart
 policy update can move the policy end date and there was no other way to follow it.
 
-Set **fire after (minutes)** — negative is allowed — and press **retime** on a pending row.
+Set **fire after (minutes)** — negative is allowed — and **message to deliver**, then press
+**update** on a pending row. The same two inputs that create a schedule also edit one, so there is
+no second form: `update` pushes both onto the row it sits beside.
 
-The reference point is *now, at the moment of the update*, never the time the schedule used to have.
-Moving a trigger earlier is not a special case. Measured 10.09.2026, a row created at 12:00 to fire
-at 12:30 and retimed at 12:05:
+The route takes each field on its own and requires at least one, because the two are independent.
+The timer's payload is only the schedule id and the dispatcher reads the message off the row when it
+fires, so changing the text needs no `UpdateSchedule` call at all — and a message-only edit must not
+re-anchor a recurring chain, which is why the patch is assembled from whichever fields arrived
+rather than always written whole.
 
-| Retimed to | Accepted | Fires |
-| --- | --- | --- |
-| 12:15 — earlier, still future | yes, verbatim | 12:15 |
-| 12:45 — later | yes, verbatim | 12:45 |
-| 12:05 — already gone | yes, verbatim | within about 40 seconds |
+The reference point for a time is *now, at the moment of the update*, never the time the schedule
+used to have. Moving a trigger earlier is not a special case. Measured 10.09.2026 — a row created at
+12:00 to fire at 12:30, updated at 12:05 — plus one direct-SDK run isolating Scheduler from this
+PoC entirely:
 
-**A past target is not rejected, and does not need to be.** `at()` an hour in the past is accepted
-by Scheduler, and a schedule two minutes in the past invoked the function about 45 seconds after
-being created — the same latency as any other fire. That was measured on 10.09.2026 because an
-earlier version of this PoC assumed the opposite and pushed a past time forward to `now + 10s`. The
-assumption was wrong, the lead time it needed is gone, and a backwards retime now does what anyone
-asking for one means: fires straight away.
+| Updated to | Accepted | Fires | Delay measured |
+| --- | --- | --- | --- |
+| earlier, still future | yes, verbatim | at the new time | 10.5–21.3 s late |
+| later | yes, verbatim | at the new time, and **not** at the old one | 23.8–39.7 s late |
+| already gone | yes, verbatim | straight away | 35.6–46.4 s after the call |
 
-**Retiming twice leaves one timer, not two.** The timer's name is derived from the row id, so
+**A past target is not rejected, and does not need to be.** `at()` in the past is accepted by
+Scheduler, stored verbatim — `GetSchedule` reads back `at(2026-09-10T06:36:19)` for a time five
+minutes gone, with no clamping — and fires about 40 seconds later, the same latency as any other
+fire. That was measured on 10.09.2026 because an earlier version of this PoC assumed the opposite
+and pushed a past time forward to `now + 10s`. The assumption was wrong, the lead time it needed is
+gone, and a backwards update now does what anyone asking for one means: fires straight away.
+
+**The fire is Scheduler's own, not a repair.** The obvious objection is that the reconciler noticed
+an overdue row and re-created its timer. It did not, and the isolating run says so: a schedule
+created straight through the SDK — no DynamoDB row anywhere, so nothing for the reconciler to sweep
+— was updated to a time five minutes past and invoked the function 41.9 seconds later, while the
+reconciler ticks either side of it reported `pending:0, processing:0, repaired:0, orphansDeleted:0`.
+[dispatch.mjs](../src/dispatch.mjs) backs that up: the reconciler repairs missing timers, deletes
+orphans and unsticks `processing` rows, and has no path that compares `triggerAt` to now or calls
+the dispatcher. It cannot make a row fire. It only rebuilds the clock.
+
+Three probes 25 seconds apart, all aimed 10 minutes into the past, fired 41.31 / 41.22 / 41.90
+seconds after **their own creation** rather than clustering on a wall-clock boundary — so there is
+no periodic sweep inside Scheduler to wait for, and the reconciler's repair of an overdue
+occurrence carries no hidden floor beyond its own cadence. Three samples, one region, one session,
+and AWS documents none of this: enough to say it works, not enough to promise a latency.
+
+**Updating twice leaves one timer, not two.** The timer's name is derived from the row id, so
 `UpdateSchedule` replaces the same object however many times a caller changes their mind — verified
-by counting the group after two retimes. The cancel-and-recreate workaround the old service forces
+by counting the group after two updates, and by the row's timer list holding exactly one name
+throughout. The cancel-and-recreate workaround the old service forces
 cannot offer that: it is two writes to two systems with a window in between where the cancel landed
 and the create has not.
 
 **The recurrence anchor moves with it.** A recurring row computes the next occurrence as
 `beginAt + period × (counter + 1)`, so moving `triggerAt` alone would leave the chain anchored to
-the time the schedule used to have — the retime would look correct and then undo itself one fire
+the time the schedule used to have — the update would look correct and then undo itself one fire
 later. `processingData` is re-anchored and the counter reset; there is a test for exactly that,
 because it is the failure that would not be noticed in a demo.
 
-`executed`, `cancelled` and `failed` rows answer `409`. Retiming a terminal row would be inventing
+`executed`, `cancelled` and `failed` rows answer `409`. Updating a terminal row would be inventing
 a resurrection path nobody designed, and `activate` already covers the one case where bringing a row
 back is intended.
 

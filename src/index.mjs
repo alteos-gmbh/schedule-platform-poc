@@ -141,25 +141,66 @@ const ROUTES = {
    */
   'POST /schedule': async ({ body, log }) => {
     const errors = validateCreateSimple(body);
+
+    /**
+     * `count` exists to answer one question the old service answers differently: what happens when
+     * a batch of jobs comes due at the same moment.
+     *
+     * There, one poller selected up to `BATCH_SIZE` rows and ran them itself —
+     * `executeScheduledActions.ts:111-121`, a sequential `for` over the `.fifo` topics and one
+     * `Promise.all` over the rest. Here every occurrence carries its own timer, so a batch is not a
+     * batch: Scheduler invokes the function once per row and Lambda decides how many of those run
+     * at once. Creating N rows on one timestamp is the only way to see that difference rather than
+     * argue about it.
+     *
+     * Capped at 20. The point is to make concurrency observable, and a demo that can quietly mint a
+     * thousand timers is a demo that can quietly cost money and pin the account's concurrency.
+     */
+    const count = body?.count === undefined ? 1 : Number(body.count);
+    if (!Number.isInteger(count) || count < 1 || count > 20) {
+      errors.push('count must be a whole number between 1 and 20');
+    }
     if (errors.length) return badRequest(errors);
 
-    const row = newSimpleRow(body);
-    await putRow(row);
-    await createSchedule(row);
+    /**
+     * One timestamp for the whole burst, taken once. Reading it per row would spread the triggers
+     * across however long the loop takes and the thing under test would be gone.
+     */
+    const rows = Array.from({ length: count }, (_, index) =>
+      newSimpleRow({
+        ...body,
+        message: count === 1 ? body.message : `${body.message} (${index + 1}/${count})`,
+      })
+    );
+
+    /**
+     * Serial on purpose, even though these are independent writes. The burst under test is
+     * Scheduler firing N timers at once; making the *setup* concurrent as well would mean a failure
+     * here could not be told apart from a failure there.
+     */
+    for (const row of rows) {
+      await putRow(row);
+      await createSchedule(row);
+    }
 
     log('api', 'created', {
-      scheduleId: row.id,
-      triggerAt: row.triggerAt,
-      period: row.period,
+      count,
+      scheduleIds: rows.map((row) => row.id),
+      triggerAt: rows[0].triggerAt,
+      period: rows[0].period,
     });
 
     return json(201, {
-      created: [{ id: row.id, status: row.status, triggerAt: row.triggerAt }],
+      created: rows.map((row) => ({
+        id: row.id,
+        status: row.status,
+        triggerAt: row.triggerAt,
+      })),
     });
   },
 
   /**
-   * Retime one schedule.
+   * Retime or repayload one schedule — move when it fires, change what it delivers, or both.
    *
    * The design has this as `PATCH /v1/schedules/:id` — "retime or repayload"; the id is in the body
    * here only because this router matches whole paths and a demo does not need path parameters.
@@ -169,53 +210,90 @@ const ROUTES = {
    * as the design puts it. Nothing forbade an update; there was simply never one to call.
    */
   'POST /schedule/update': async ({ body, log }) => {
-    if (!validateIsoDate(body?.triggerAt)) {
-      return badRequest(['triggerAt must be an ISO date']);
+    /**
+     * Both fields are optional and at least one is required, so moving a trigger and correcting
+     * the text it delivers are the same call. `message` is deliberately not forced along with a
+     * retime: the timer carries only the id, and the dispatcher reads the message off the row when
+     * it fires, so the two are independent and pretending otherwise would make one overwrite the
+     * other by accident.
+     */
+    const wantsTime = body?.triggerAt !== undefined;
+    const wantsMessage = body?.message !== undefined;
+    const errors = [];
+
+    // A non-object body leaves both fields undefined and lands on the same message, so it needs
+    // no separate check.
+    if (!wantsTime && !wantsMessage) {
+      errors.push('one of triggerAt or message is required');
     }
+    if (wantsTime && !validateIsoDate(body.triggerAt)) {
+      errors.push('triggerAt must be an ISO date');
+    }
+    // Same two rules the create route applies, so a message cannot be updated into a shape that
+    // could never have been created.
+    if (wantsMessage && (typeof body.message !== 'string' || body.message.trim() === '')) {
+      errors.push('message must be a non-empty string');
+    }
+    if (wantsMessage && typeof body.message === 'string' && body.message.length > 500) {
+      errors.push('message must be 500 characters or fewer');
+    }
+    if (errors.length) return badRequest(errors);
 
     const row = await getRow(body?.scheduleId);
     if (!row) return json(404, { error: 'no such schedule' });
 
     /**
      * Only a row that has not fired yet. `executed` is history, `cancelled` and `failed` are
-     * terminal — retiming any of them would be inventing a resurrection path nobody has designed,
+     * terminal — updating any of them would be inventing a resurrection path nobody has designed,
      * and `activate` already exists for the one case where bringing a row back is intended.
      */
     const retimable = [STATUS.Pending, STATUS.WaitingExecutionApproval];
     if (!retimable.includes(row.status)) {
       return json(409, {
-        error: `cannot retime a schedule that is ${row.status}`,
+        error: `cannot update a schedule that is ${row.status}`,
         retimable,
       });
     }
 
-    const triggerAt = new Date(body.triggerAt).toISOString();
+    const triggerAt = wantsTime
+      ? new Date(body.triggerAt).toISOString()
+      : row.triggerAt;
 
-    // `retimePatch` re-anchors a recurring chain; see its note for why that is not optional.
-    const updated = await transition(
-      row.id,
-      row.status,
-      row.status,
-      retimePatch(row, triggerAt)
-    );
-    if (!updated) return json(409, { error: 'status changed while retiming' });
+    // `retimePatch` re-anchors a recurring chain; see its note for why that is not optional. It is
+    // only applied when the time actually moved — a message-only edit must not reset the counter.
+    const updated = await transition(row.id, row.status, row.status, {
+      ...(wantsTime ? retimePatch(row, triggerAt) : {}),
+      ...(wantsMessage ? { message: body.message } : {}),
+    });
+    if (!updated) return json(409, { error: 'status changed while updating' });
 
-    // A parked row has no timer and must not get one — that is what `activate` is for.
-    if (updated.status === STATUS.Pending) await updateSchedule(updated);
+    /**
+     * The timer only needs rewriting when the time moved: its payload is just the id, and the
+     * message is read off the row at dispatch. A parked row has no timer and must not get one —
+     * that is what `activate` is for.
+     */
+    if (wantsTime && updated.status === STATUS.Pending) {
+      await updateSchedule(updated);
+    }
 
-    // A target in the past is not a special case: Scheduler accepts it and fires as soon as it
-    // gets there, so the row is simply retimed and the caller has nothing extra to interpret.
-    log('api', 'retimed', {
+    // A target in the past is not a special case. Measured 10.09.2026 on both paths: Scheduler
+    // stores the missed time verbatim — `GetSchedule` reads back `at(2026-09-10T06:36:19)` for a
+    // time five minutes gone — and invoked the function 41.9s later with no DynamoDB row present
+    // and the reconciler reporting `pending:0, repaired:0`. So the fire is Scheduler's own, not a
+    // repair, and the row is simply retimed with nothing extra for the caller to interpret.
+    log('api', 'updated', {
       scheduleId: row.id,
-      from: row.triggerAt,
-      to: triggerAt,
-      inThePast: Date.parse(triggerAt) <= Date.now(),
+      ...(wantsTime
+        ? { from: row.triggerAt, to: triggerAt, inThePast: Date.parse(triggerAt) <= Date.now() }
+        : {}),
+      ...(wantsMessage ? { message: body.message } : {}),
     });
 
     return json(200, {
       scheduleId: row.id,
       status: updated.status,
       triggerAt,
+      message: updated.message,
     });
   },
 

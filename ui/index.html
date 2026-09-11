@@ -204,6 +204,10 @@
             <label for="period">repeat every (blank = fire once)</label>
             <input id="period" value="PT1M" />
           </div>
+          <div>
+            <label for="count">how many, all on the same second</label>
+            <input id="count" type="number" value="1" min="1" max="20" step="1" />
+          </div>
         </div>
         <p class="row" style="margin-top: 14px">
           <button class="primary" id="create">create</button>
@@ -323,15 +327,20 @@
 
       $('create').addEventListener('click', async () => {
         const period = $('period').value.trim();
+        const count = Number($('count').value) || 1;
         const { status, data } = await api('POST', '/schedule', {
           triggerAt: startAtFor(),
           message: $('message').value,
           ...(period ? { period } : {}),
+          ...(count > 1 ? { count } : {}),
         });
 
         $('createResult').textContent =
           status === 201
-            ? `created ${short(data.created[0].id)}, fires ${data.created[0].triggerAt}`
+            ? data.created.length === 1
+              ? `created ${short(data.created[0].id)}, fires ${data.created[0].triggerAt}`
+              : `created ${data.created.length} rows all firing ${data.created[0].triggerAt}` +
+                ' — each gets its own timer and its own invocation'
             : `${status}: ${JSON.stringify(data.errors ?? data)}`;
         refresh();
       });
@@ -426,20 +435,25 @@
               button('cancel', () =>
                 api('POST', '/schedule/cancel', { scheduleIds: [row.id] })
               ),
-              // Retimes to whatever "fire after (minutes)" says right now, so one field drives both
-              // creating and moving and there is nothing extra on screen to explain.
-              button('retime', async () => {
+              /**
+               * Pushes both fields of the create form onto this row, so the same two inputs drive
+               * creating and editing and there is nothing extra on screen to explain. A negative
+               * "fire after" moves the trigger into the past, which is a real target rather than
+               * an error: Scheduler keeps the missed time and fires it in about 40 seconds.
+               */
+              button('update', async () => {
                 const { status, data } = await api('POST', '/schedule/update', {
                   scheduleId: row.id,
                   triggerAt: startAtFor(),
+                  message: $('message').value,
                 });
                 $('createResult').textContent =
                   status === 200
-                    ? `${short(row.id)} retimed to ${data.triggerAt}` +
+                    ? `${short(row.id)} now fires ${data.triggerAt} saying "${data.message}"` +
                       (Date.parse(data.triggerAt) <= Date.now()
                         ? ' — already past, so it fires straight away'
                         : '')
-                    : `${status}: ${data.error ?? JSON.stringify(data)}`;
+                    : `${status}: ${data.error ?? JSON.stringify(data.errors ?? data)}`;
               }),
               // The two below break the platform on purpose: one takes the timer away from a live
               // row, the other takes the row away from a live timer. Both are what the reconciler
