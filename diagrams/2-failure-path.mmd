@@ -1,0 +1,11 @@
+flowchart TD
+    F["publish or chain write throws"] --> A["attempts += 1"]
+    A --> B{"attempts >= invocationsPerFiring?"}
+    B -->|no| S1["row stays processing<br/>re-throw, Lambda retries<br/>this same firing"]
+    S1 --> F
+    B -->|yes| DLQ[["Lambda async retries exhausted<br/>on_failure writes ONE<br/>dead-letter record"]]
+    B -->|yes| C{"deliveries >= maxDeliveryAttempts?"}
+    C -->|no| S2["row stays processing<br/>this firing is spent"]
+    C -->|yes| T["row to failed + failedAt<br/>TERMINAL — nothing re-fires it,<br/>no timer is created"]
+    S2 --> R["reconciler, after the processing TTL:<br/>deliveries += 1, attempts = 0<br/>row to pending, new timer"]
+    R --> F

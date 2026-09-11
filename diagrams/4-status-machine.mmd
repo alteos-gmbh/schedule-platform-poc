@@ -1,0 +1,27 @@
+stateDiagram-v2
+    direction TB
+    [*] --> pending : create
+    [*] --> waitingExecutionApproval : create with waitForApproval
+
+    pending --> pending : update
+    waitingExecutionApproval --> waitingExecutionApproval : update
+    waitingExecutionApproval --> pending : activate
+    pending --> cancelled : cancel
+    pending --> processing : claim (conditional write)
+    processing --> processing : claim again (same firing retried),<br/>or an attempt failed with budget left
+    processing --> executed : published + chain step committed
+    processing --> failed : both budgets spent
+    processing --> pending : reconciler unstuck, after the TTL
+    processing --> failed : reconciler gave up
+    failed --> [*]
+    executed --> [*]
+    cancelled --> [*]
+
+    note left of cancelled
+      activate writes pending from ANY status with no
+      status guard — so executed, cancelled and failed
+      rows can all be resurrected. Ported deliberately:
+      the old service updated by id IN (...) with no
+      condition. Almost certainly not intended there
+      either.
+    end note

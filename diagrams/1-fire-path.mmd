@@ -1,0 +1,16 @@
+sequenceDiagram
+    autonumber
+    participant S as EventBridge Scheduler
+    participant L as poc-schedule
+    participant D as DynamoDB
+    participant Q as SQS
+    participant C as consumer
+
+    S->>L: invoke (async) — Input is only {scheduleId}
+    L->>D: GetItem
+    L->>D: UpdateItem, conditional — claim to processing
+    Note over L,D: a lost claim stops here:<br/>logged notClaimable, nothing published
+    L->>Q: SendMessage
+    L->>D: TransactWriteItems — current to executed<br/>AND next occurrence as pending
+    L->>S: CreateSchedule for the next occurrence
+    Q->>C: deliver

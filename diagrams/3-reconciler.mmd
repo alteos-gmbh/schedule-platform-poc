@@ -1,0 +1,10 @@
+flowchart TD
+    T["tick — every 60 s"] --> READ["read: pending rows, processing rows,<br/>live timer names in the group"]
+    READ --> Q1{"pending row<br/>with no timer?"}
+    Q1 -->|yes| R1["CreateSchedule from the row's own<br/>triggerAt, VERBATIM — not from now"]
+    READ --> Q2{"timer with no<br/>pending row?"}
+    Q2 -->|yes| R2["DeleteSchedule — orphan.<br/>Only names this platform minted;<br/>Terraform owns the reconciler's own"]
+    READ --> Q3{"processing row older<br/>than the TTL?"}
+    Q3 -->|yes| Q4{"deliveries >= max?"}
+    Q4 -->|yes| R3["row to failed — gave up"]
+    Q4 -->|no| R4["row to pending, deliveries += 1,<br/>attempts = 0, CreateSchedule"]
