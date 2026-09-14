@@ -1,0 +1,46 @@
+flowchart TB
+    CALLER["<b>Amazon EKS</b><br/>policy · workflow<br/>create / cancel a schedule"]
+
+    FN["<b>AWS Lambda</b> — schedule function<br/>nodejs22.x · arm64 · 512 MB · 30 s<br/>no Function URL, no API Gateway<br/>router · dispatcher · reconciler<br/><br/>event invoke config:<br/>maximum_retry_attempts = 2<br/>on_failure destination"]
+
+    EBS["<b>Amazon EventBridge Scheduler</b><br/>one schedule group<br/>one-shot at() per occurrence<br/>rate() tick for the reconciler"]
+
+    DDB[("<b>Amazon DynamoDB</b><br/>PAY_PER_REQUEST<br/>GSI byPolicy · GSI byStatus")]
+
+    QSTD[["<b>SQS</b> standard<br/>target queue"]]
+    QFIFO[["<b>SQS</b> FIFO<br/>MessageGroupId = policyId"]]
+    QDLQ[["<b>SQS</b> dead-letter<br/>SSE · 14-day retention"]]
+
+    CW["<b>Amazon CloudWatch Logs</b><br/>PoC only — the real function<br/>ships logs via the Datadog extension"]
+
+    CONSUMER["<b>Amazon EKS</b><br/>policy · accounting · workflow<br/>poll their job queue"]
+
+    subgraph IAM["AWS IAM — two roles, no human principal"]
+        direction LR
+        RLAMBDA["role: lambda<br/>trusted by lambda.amazonaws.com"]
+        RSCHED["role: scheduler<br/>trusted by scheduler.amazonaws.com"]
+    end
+
+    subgraph GONE["dropped by this migration"]
+        direction LR
+        RDS[("RDS PostgreSQL<br/>schedule-db")]
+        REDIS[("ElastiCache Redis<br/>schedule-cache, the poller lock")]
+        PODS["EKS pods running node-cron<br/>2-7 replicas"]
+    end
+
+    CALLER -->|"lambda:InvokeFunction"| FN
+    FN -->|"CreateSchedule<br/>UpdateSchedule<br/>DeleteSchedule"| EBS
+    EBS -->|"Invoke<br/>InvocationType = Event"| FN
+    FN -->|"PutItem · UpdateItem<br/>TransactWriteItems · Query"| DDB
+    FN -->|"SendMessage"| QSTD
+    FN -->|"SendMessage"| QFIFO
+    FN -->|"PutLogEvents"| CW
+    QSTD -->|"ReceiveMessage"| CONSUMER
+    QFIFO -->|"ReceiveMessage"| CONSUMER
+
+    FN -.->|"Lambda retries exhausted"| QDLQ
+    EBS -.->|"fire never delivered"| QDLQ
+
+    RLAMBDA -.-> FN
+    FN -.->|"iam:PassRole"| RSCHED
+    RSCHED -.-> EBS

@@ -1,0 +1,47 @@
+flowchart LR
+    subgraph CALLERS["callers"]
+        direction TB
+        POL["policy<br/>invoice periods, terminations,<br/>reactivation, payment retry"]
+        WFC["workflow<br/>parkDeadline / cancelDeadline<br/>for flow-engine"]
+    end
+
+    subgraph PLATFORM["schedule platform"]
+        direction TB
+        FN["schedule function<br/>ONE Lambda, no URL<br/>router · dispatcher · reconciler"]
+        DDB[("DynamoDB<br/>source of truth")]
+        EB["EventBridge Scheduler<br/>timer only, no state"]
+        FN <-->|"intent + state"| DDB
+        FN -->|"one one-shot timer<br/>per occurrence"| EB
+        EB -->|"fire: async invoke,<br/>Input is only {scheduleId}"| FN
+    end
+
+    subgraph QUEUES["SQS"]
+        direction TB
+        QP[["policy-jobs.fifo"]]
+        QA[["accounting-jobs"]]
+        QW[["workflow-jobs"]]
+        QE[["email<br/>(declared, no consumer found)"]]
+        DLQ[["dead-letter queue"]]
+    end
+
+    subgraph CONSUMERS["consumers"]
+        direction TB
+        CPOL["policy<br/>processInvoicePeriod"]
+        CACC["accounting"]
+        CWF["workflow<br/>relayFiredTimer"]
+        FE["flow-engine<br/>applies TIMER_FIRED"]
+    end
+
+    POL -->|"lambda:Invoke, IAM-gated"| FN
+    WFC -->|"lambda:Invoke, IAM-gated"| FN
+
+    FN --> QP
+    FN --> QA
+    FN --> QW
+    FN --> QE
+    FN -.->|"Lambda on_failure,<br/>not Scheduler's own DLQ"| DLQ
+
+    QP --> CPOL
+    QA --> CACC
+    QW --> CWF
+    CWF -->|"flow-engine.commands"| FE
