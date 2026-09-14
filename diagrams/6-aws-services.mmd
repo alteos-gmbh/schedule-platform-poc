@@ -1,16 +1,17 @@
-flowchart LR
-    CALLER["<b>Amazon EKS</b><br/>calling services"]
-    FN["<b>AWS Lambda</b><br/>schedule service"]
-    DDB[("<b>Amazon DynamoDB</b><br/>schedules and their state")]
-    EBS["<b>Amazon EventBridge Scheduler</b><br/>one timer per occurrence"]
-    SQS[["<b>Amazon SQS</b><br/>job queues"]]
-    DLQ[["<b>Amazon SQS</b><br/>dead-letter queue"]]
-    CONSUMER["<b>Amazon EKS</b><br/>consuming services"]
+architecture-beta
+    group callers(logos:aws-eks)[Calling services on EKS]
+    group platform(logos:aws)[Schedule platform]
+    group consumers(logos:aws-eks)[Consuming services on EKS]
 
-    CALLER -->|"lambda:Invoke, IAM-gated"| FN
-    FN <-->|"source of truth"| DDB
-    FN -->|"set · move · cancel a timer"| EBS
-    EBS -->|"the timer fires"| FN
-    FN -->|"one message per fire"| SQS
-    SQS --> CONSUMER
-    FN -.->|"delivery gave up"| DLQ
+    service caller(server)[policy and workflow] in callers
+    service fn(logos:aws-lambda)[Schedule service] in platform
+    service ddb(logos:aws-dynamodb)[Schedules and state] in platform
+    service sched(logos:aws-eventbridge)[One timer per occurrence] in platform
+    service jobs(logos:aws-sqs)[Job queues] in platform
+    service consumer(server)[policy accounting workflow] in consumers
+
+    caller:R --> L:fn
+    fn:T <--> B:ddb
+    fn:B <--> T:sched
+    fn:R --> L:jobs
+    jobs:R --> L:consumer
