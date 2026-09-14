@@ -1,13 +1,13 @@
 architecture-beta
-    group callers(logos:aws-eks)[Calling services on EKS]
+    group callers(logos:aws-eks)[Amazon EKS - calling services]
     group platform(logos:aws)[Schedule platform]
-    group consumers(logos:aws-eks)[Consuming services on EKS]
+    group consumers(logos:aws-eks)[Amazon EKS - consuming services]
 
     service caller(server)[policy and workflow] in callers
-    service fn(logos:aws-lambda)[Schedule service] in platform
-    service ddb(logos:aws-dynamodb)[Schedules and state] in platform
-    service sched(logos:aws-eventbridge)[One timer per occurrence] in platform
-    service jobs(logos:aws-sqs)[Job queues] in platform
+    service fn(logos:aws-lambda)[AWS Lambda - schedule service] in platform
+    service ddb(logos:aws-dynamodb)[Amazon DynamoDB - schedules and state] in platform
+    service sched(logos:aws-eventbridge)[Amazon EventBridge Scheduler - one timer per occurrence] in platform
+    service jobs(logos:aws-sqs)[Amazon SQS - job queues] in platform
     service consumer(server)[policy accounting workflow] in consumers
 
     caller:R --> L:fn
